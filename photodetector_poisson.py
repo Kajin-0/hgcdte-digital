@@ -959,8 +959,8 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     J_compiled = fem.form(J_form)
 
     # --- Allocate residual vector and Jacobian matrix ---
-    # DOLFINx 0.10: create_vector takes FunctionSpace, not Form
-    b_vec = fem_petsc.create_vector(phi_hat.function_space)
+    # Create vector matching the form's index map (correct ghost structure)
+    b_vec = fem.Function(phi_hat.function_space).x.petsc_vec.copy()
     A_mat = fem_petsc.create_matrix(J_compiled)
 
     # --- SNES residual callback ---
@@ -975,11 +975,14 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
             f_local.set(0.0)
         fem_petsc.assemble_vector(F_out, F_compiled)
 
-        # Apply lifting for Dirichlet BCs
+        # Apply BC lifting: modify F for Dirichlet constraints
+        # For nonlinear: x0 is current solution, alpha=-1 handles
+        # F_modified = F - J * (x_bc - x0) on BC dofs
         fem_petsc.apply_lifting(F_out, [J_compiled], bcs=[bcs],
                                 x0=[X], alpha=-1.0)
         F_out.ghostUpdate(addv=PETSc.InsertMode.ADD,
                           mode=PETSc.ScatterMode.REVERSE)
+        # Zero out BC rows: F[bc_dof] = x[bc_dof] - bc_value
         fem_petsc.set_bc(F_out, bcs, x0=X, alpha=-1.0)
 
     # --- SNES Jacobian callback ---
@@ -1002,9 +1005,11 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     snes.setType("newtonls")
     snes.setTolerances(rtol=snes_rtol, atol=snes_atol, max_it=max_newton)
 
-    # Line search: backtracking for robustness
+    # Line search: basic (full Newton step) — the linear Poisson initial guess
+    # is typically so close that backtracking causes spurious failures.
+    # Use -snes_linesearch_type bt on CLI to switch to backtracking if needed.
     ls = snes.getLineSearch()
-    ls.setType("bt")
+    ls.setType("basic")
 
     # KSP: GMRES + AMG (GMRES safer than CG for non-SPD Jacobians)
     ksp = snes.getKSP()
