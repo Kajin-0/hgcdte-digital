@@ -64,11 +64,38 @@ from pathlib import Path
 import numpy as np
 from mpi4py import MPI
 
-# CRITICAL: Initialize petsc4py with sys.argv so PETSc picks up CLI flags
-# like -snes_monitor, -ksp_monitor, etc. Must happen BEFORE importing PETSc.
+# Split sys.argv: argparse flags start with --, PETSc flags start with single -
+# We must init petsc4py with PETSc flags BEFORE importing PETSc.
+_petsc_argv = [sys.argv[0]]
+_app_argv = [sys.argv[0]]
+_i = 1
+while _i < len(sys.argv):
+    arg = sys.argv[_i]
+    if arg.startswith("--"):
+        # Application flag (argparse)
+        _app_argv.append(arg)
+        # Grab its value if present
+        if _i + 1 < len(sys.argv) and not sys.argv[_i + 1].startswith("-"):
+            _app_argv.append(sys.argv[_i + 1])
+            _i += 2
+        else:
+            _i += 1
+    else:
+        # PETSc flag (single dash)
+        _petsc_argv.append(arg)
+        # Grab its value if present
+        if _i + 1 < len(sys.argv) and not sys.argv[_i + 1].startswith("-"):
+            _petsc_argv.append(sys.argv[_i + 1])
+            _i += 2
+        else:
+            _i += 1
+
 import petsc4py
-petsc4py.init(sys.argv)
+petsc4py.init(_petsc_argv)
 from petsc4py import PETSc
+
+# Override sys.argv so argparse only sees application flags
+sys.argv = _app_argv
 
 import dolfinx
 import dolfinx.fem as fem
@@ -883,14 +910,32 @@ def build_nonlinear_poisson(msh, scaling, dims, V_bias, Nd, Na, n_i,
                            dofs_R, V)
     bcs = [bc_L, bc_R]
 
-    # Initial guess: linear interpolation between BCs (much better than zero)
-    phi_bias_hat = scaling.phi_to_dimless(V_bias)
-    x_coord = ufl.SpatialCoordinate(msh)
-    # Can't easily interpolate SpatialCoordinate, so do it via expression
-    def linear_guess(x):
-        # Linear ramp in x from 0 to phi_bias_hat
-        return phi_bias_hat * (x[0] / Lx_hat)
-    phi_hat.interpolate(linear_guess)
+    # Initial guess: solve LINEAR Poisson with doping as RHS.
+    # This gives a much better starting point than a naive ramp,
+    # because it already accounts for the doping-induced potential.
+    rho_dop_val = (Nd - Na) / scaling.n_ref
+    if abs(rho_dop_val) > 1e-30:
+        rho_dop_expr = lambda x: np.full(x.shape[1], rho_dop_val)
+    else:
+        rho_dop_expr = None
+
+    if msh.comm.rank == 0:
+        print(f"  Computing linear Poisson initial guess (rho_dop={rho_dop_val:.3e})...",
+              flush=True)
+
+    # Solve linear Poisson for initial guess
+    V_lin, A_lin, b_lin, bcs_lin, phi_lin = build_poisson_system(
+        msh, scaling, dims, V_bias, rho_hat_expr=rho_dop_expr
+    )
+    solve_poisson(A_lin, b_lin, phi_lin, SolverConfig(), msh.comm)
+
+    # Copy linear solution into phi_hat as initial guess
+    phi_hat.x.array[:] = phi_lin.x.array[:]
+    phi_hat.x.scatter_forward()
+
+    if msh.comm.rank == 0:
+        print(f"  Initial guess: phi_hat in [{phi_hat.x.array.min():.4f}, "
+              f"{phi_hat.x.array.max():.4f}]", flush=True)
 
     return V, F_form, J_form, bcs, phi_hat, phi_ref_hat_value
 
@@ -1004,8 +1049,9 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     _SNES_REASONS = {
         2: "RTOL", 3: "ATOL", 4: "STOL", 5: "ITS",
         -1: "FNORM_NAN", -2: "FUNCTION_COUNT", -3: "LINEAR_SOLVE",
-        -4: "FUNCTION_RANGE", -5: "DIVERGED_LINE_SEARCH",
-        -6: "MAX_IT", -7: "DTOL", -8: "DIVERGED_LOCAL_MIN",
+        -4: "FUNCTION_RANGE", -5: "DTOL",
+        -6: "DIVERGED_LINE_SEARCH", -7: "DIVERGED_LOCAL_MIN",
+        -8: "MAX_IT",
     }
     reason_str = _SNES_REASONS.get(reason, f"CODE_{reason}")
 
