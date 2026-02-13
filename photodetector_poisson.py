@@ -970,20 +970,20 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
         X.copy(phi_hat.x.petsc_vec)
         phi_hat.x.scatter_forward()
 
-        # Zero and assemble
+        # Zero and assemble the nonlinear residual
         with F_out.localForm() as f_local:
             f_local.set(0.0)
         fem_petsc.assemble_vector(F_out, F_compiled)
 
-        # Apply BC lifting: modify F for Dirichlet constraints
-        # For nonlinear: x0 is current solution, alpha=-1 handles
-        # F_modified = F - J * (x_bc - x0) on BC dofs
+        # BC handling for SNES:
+        # 1) apply_lifting adjusts non-BC rows for the constraint contribution.
+        #    When x satisfies BCs (x[bc] ≈ g), the correction is ~0.
+        # 2) set_bc sets BC rows to (x[bc] - g) so SNES drives them to zero.
         fem_petsc.apply_lifting(F_out, [J_compiled], bcs=[bcs],
                                 x0=[X], alpha=-1.0)
         F_out.ghostUpdate(addv=PETSc.InsertMode.ADD,
                           mode=PETSc.ScatterMode.REVERSE)
-        # Zero out BC rows: F[bc_dof] = x[bc_dof] - bc_value
-        fem_petsc.set_bc(F_out, bcs, x0=X, alpha=-1.0)
+        fem_petsc.set_bc(F_out, bcs, X)
 
     # --- SNES Jacobian callback ---
     def snes_J(snes_obj, X, J_out, P_out):
