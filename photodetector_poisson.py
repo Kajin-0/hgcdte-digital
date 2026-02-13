@@ -895,30 +895,58 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
                             max_newton=50, snes_rtol=1e-8, snes_atol=1e-10,
                             verbose=True):
     """
-    Solve F(phi_hat) = 0 using raw PETSc SNES (no dolfinx.nls.petsc.NewtonSolver).
+    Solve F(phi_hat) = 0 using raw PETSc SNES with hand-written assembly
+    callbacks. No dolfinx.nls.petsc.NewtonSolver — maximum compatibility.
 
-    Uses fem_petsc.NonlinearProblem for residual/Jacobian assembly,
-    then drives PETSc SNES directly for maximum DOLFINx 0.10 compatibility.
+    F_form, J_form: UFL forms (NOT compiled fem.form objects).
+    phi_hat: fem.Function to solve into (initial guess on entry).
+    bcs: list of DirichletBC.
 
-    Reports SNES convergence, exp-argument clamp diagnostics.
     Returns dict with convergence info + clamp diagnostics.
     """
-    # --- Build NonlinearProblem (assembles F and J) ---
-    NL_PREFIX = "nl_"
-    problem = fem_petsc.NonlinearProblem(
-        F_form, phi_hat, bcs=bcs, J=J_form,
-        petsc_options_prefix=NL_PREFIX,
-    )
+    # --- Compile UFL forms ---
+    F_compiled = fem.form(F_form)
+    J_compiled = fem.form(J_form)
 
-    # --- Create raw PETSc SNES ---
+    # --- Allocate residual vector and Jacobian matrix ---
+    b_vec = fem_petsc.create_vector(F_compiled)
+    A_mat = fem_petsc.create_matrix(J_compiled)
+
+    # --- SNES residual callback ---
+    def snes_F(snes_obj, X, F_out):
+        """Assemble residual F(X) into F_out."""
+        # Push SNES iterate X into phi_hat
+        X.copy(phi_hat.x.petsc_vec)
+        phi_hat.x.scatter_forward()
+
+        # Zero and assemble
+        with F_out.localForm() as f_local:
+            f_local.set(0.0)
+        fem_petsc.assemble_vector(F_out, F_compiled)
+
+        # Apply lifting for Dirichlet BCs
+        fem_petsc.apply_lifting(F_out, [J_compiled], bcs=[bcs],
+                                x0=[X], alpha=-1.0)
+        F_out.ghostUpdate(addv=PETSc.InsertMode.ADD,
+                          mode=PETSc.ScatterMode.REVERSE)
+        fem_petsc.set_bc(F_out, bcs, x0=X, alpha=-1.0)
+
+    # --- SNES Jacobian callback ---
+    def snes_J(snes_obj, X, J_out, P_out):
+        """Assemble Jacobian J(X) into J_out (and preconditioner P_out)."""
+        # Push SNES iterate X into phi_hat
+        X.copy(phi_hat.x.petsc_vec)
+        phi_hat.x.scatter_forward()
+
+        J_out.zeroEntries()
+        fem_petsc.assemble_matrix(J_out, J_compiled, bcs=bcs)
+        J_out.assemble()
+
+    # --- Create and configure SNES ---
     snes = PETSc.SNES().create(comm)
-    snes.setOptionsPrefix(NL_PREFIX)
+    snes.setFunction(snes_F, b_vec)
+    snes.setJacobian(snes_J, A_mat, A_mat)
 
-    # Wire residual and Jacobian from NonlinearProblem
-    snes.setFunction(problem.F, problem.b)
-    snes.setJacobian(problem.J, problem.A)
-
-    # SNES parameters
     snes.setType("newtonls")
     snes.setTolerances(rtol=snes_rtol, atol=snes_atol, max_it=max_newton)
 
@@ -926,7 +954,7 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     ls = snes.getLineSearch()
     ls.setType("bt")
 
-    # KSP for linear sub-problems (GMRES safer than CG for non-SPD Jacobians)
+    # KSP: GMRES + AMG (GMRES safer than CG for non-SPD Jacobians)
     ksp = snes.getKSP()
     ksp.setType("gmres")
     ksp.setTolerances(rtol=1e-9, atol=1e-12, max_it=1000)
@@ -934,13 +962,13 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     pc.setType("hypre")
     pc.setHYPREType("boomeramg")
 
-    # Allow PETSc command-line overrides with prefix
+    # Allow PETSc command-line overrides
     snes.setFromOptions()
 
     # Monitor (optional)
     if verbose and comm.rank == 0:
         snes.setMonitor(
-            lambda snes_obj, it, fnorm: print(
+            lambda s, it, fnorm: print(
                 f"  SNES iter {it:3d} | ||F|| = {fnorm:.6e}"
             )
         )
@@ -971,14 +999,12 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     phi_min = comm.allreduce(phi_min_local, op=MPI.MIN)
     phi_max = comm.allreduce(phi_max_local, op=MPI.MAX)
 
-    # Compute exp argument = phi_hat - phi_ref across all DOFs
     arg_arr = phi_arr - phi_ref_hat_value
     arg_min_local = arg_arr.min()
     arg_max_local = arg_arr.max()
     arg_min = comm.allreduce(arg_min_local, op=MPI.MIN)
     arg_max = comm.allreduce(arg_max_local, op=MPI.MAX)
 
-    # Fraction of DOFs that would be clamped
     n_local = len(arg_arr)
     n_clamp_hi_local = int(np.sum(arg_arr > EXP_CLIP))
     n_clamp_lo_local = int(np.sum(arg_arr < -EXP_CLIP))
@@ -1018,7 +1044,7 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
         print(f"  DOFs clamped high : {n_clamp_hi}/{n_total} ({pct_clamp_hi:.4f}%)")
         print(f"  DOFs clamped low  : {n_clamp_lo}/{n_total} ({pct_clamp_lo:.4f}%)")
         if pct_clamp_hi > 1.0 or pct_clamp_lo > 1.0:
-            print(f"  *** WARNING: >1% DOFs clamped — solution may be physically nonsense ***")
+            print(f"  *** WARNING: >1% DOFs clamped -- solution may be physically nonsense ***")
         print(f"====================\n")
 
     snes.destroy()
