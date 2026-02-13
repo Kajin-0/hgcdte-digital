@@ -940,9 +940,16 @@ def build_nonlinear_poisson(msh, scaling, dims, V_bias, Nd, Na, n_i,
     phi_hat.x.array[:] = phi_lin.x.array[:]
     phi_hat.x.scatter_forward()
 
+    # Global min/max via MPI reduction (owned DOFs only)
+    n_own = V.dofmap.index_map.size_local
+    phi_local_min = phi_hat.x.array[:n_own].min() if n_own > 0 else 1e30
+    phi_local_max = phi_hat.x.array[:n_own].max() if n_own > 0 else -1e30
+    phi_global_min = msh.comm.allreduce(phi_local_min, op=MPI.MIN)
+    phi_global_max = msh.comm.allreduce(phi_local_max, op=MPI.MAX)
+
     if msh.comm.rank == 0:
-        print(f"  Initial guess: phi_hat in [{phi_hat.x.array.min():.4f}, "
-              f"{phi_hat.x.array.max():.4f}]", flush=True)
+        print(f"  Initial guess: phi_hat in [{phi_global_min:.4f}, "
+              f"{phi_global_max:.4f}] (global MPI min/max)", flush=True)
 
     return V, F_form, J_form, bcs, phi_hat, phi_ref_hat_value
 
@@ -1067,23 +1074,23 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     }
     reason_str = _SNES_REASONS.get(reason, f"CODE_{reason}")
 
-    # --- Exp-argument clamp diagnostics ---
-    phi_arr = phi_hat.x.array
-    phi_min_local = phi_arr.min()
-    phi_max_local = phi_arr.max()
+    # --- Exp-argument clamp diagnostics (owned DOFs only, no ghosts) ---
+    n_owned = phi_hat.function_space.dofmap.index_map.size_local
+    phi_arr = phi_hat.x.array[:n_owned]
+    phi_min_local = phi_arr.min() if n_owned > 0 else 1e30
+    phi_max_local = phi_arr.max() if n_owned > 0 else -1e30
     phi_min = comm.allreduce(phi_min_local, op=MPI.MIN)
     phi_max = comm.allreduce(phi_max_local, op=MPI.MAX)
 
     arg_arr = phi_arr - phi_ref_hat_value
-    arg_min_local = arg_arr.min()
-    arg_max_local = arg_arr.max()
+    arg_min_local = arg_arr.min() if n_owned > 0 else 1e30
+    arg_max_local = arg_arr.max() if n_owned > 0 else -1e30
     arg_min = comm.allreduce(arg_min_local, op=MPI.MIN)
     arg_max = comm.allreduce(arg_max_local, op=MPI.MAX)
 
-    n_local = len(arg_arr)
     n_clamp_hi_local = int(np.sum(arg_arr > EXP_CLIP))
     n_clamp_lo_local = int(np.sum(arg_arr < -EXP_CLIP))
-    n_total = comm.allreduce(n_local, op=MPI.SUM)
+    n_total = comm.allreduce(n_owned, op=MPI.SUM)
     n_clamp_hi = comm.allreduce(n_clamp_hi_local, op=MPI.SUM)
     n_clamp_lo = comm.allreduce(n_clamp_lo_local, op=MPI.SUM)
     pct_clamp_hi = 100.0 * n_clamp_hi / max(n_total, 1)
@@ -1138,88 +1145,94 @@ def check_jacobian_consistency(F_form, J_form, phi_hat, bcs, comm, eps=1e-7):
 
     Computes: |F(u + eps*v) - F(u) - eps*J(u)*v| / (eps * |J(u)*v|)
     Should be << 1 (typically 1e-4 to 1e-6).
+
+    Uses fem.Function for all vectors to ensure correct MPI-distributed layout.
     """
+    V = phi_hat.function_space
     F_compiled = fem.form(F_form)
     J_compiled = fem.form(J_form)
 
-    # Evaluate F(u)
-    F0 = phi_hat.x.petsc_vec.duplicate()
-    with F0.localForm() as f_local:
-        f_local.set(0.0)
-    fem_petsc.assemble_vector(F0, F_compiled)
-    fem_petsc.apply_lifting(F0, [J_compiled], bcs=[bcs],
-                            x0=[phi_hat.x.petsc_vec], alpha=-1.0)
-    F0.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-    fem_petsc.set_bc(F0, bcs, phi_hat.x.petsc_vec)
+    # --- Helper: assemble residual at current phi_hat state ---
+    def assemble_F_vec():
+        """Assemble F into a new PETSc Vec (owned by returned Function)."""
+        f = fem.Function(V)
+        fvec = f.x.petsc_vec
+        with fvec.localForm() as f_local:
+            f_local.set(0.0)
+        fem_petsc.assemble_vector(fvec, F_compiled)
+        fem_petsc.apply_lifting(fvec, [J_compiled], bcs=[bcs],
+                                x0=[phi_hat.x.petsc_vec], alpha=-1.0)
+        fvec.ghostUpdate(addv=PETSc.InsertMode.ADD,
+                         mode=PETSc.ScatterMode.REVERSE)
+        fem_petsc.set_bc(fvec, bcs, phi_hat.x.petsc_vec)
+        return f
 
-    # Assemble J(u)
+    # 1) Save current state (owned DOFs only)
+    n_owned = V.dofmap.index_map.size_local
+    u0 = phi_hat.x.array[:n_owned].copy()
+
+    # 2) Assemble F(u) at current state
+    F0_fun = assemble_F_vec()
+
+    # 3) Assemble J(u)
     A = fem_petsc.create_matrix(J_compiled)
     A.zeroEntries()
     fem_petsc.assemble_matrix(A, J_compiled, bcs=bcs)
     A.assemble()
 
-    # Random direction v (seeded for reproducibility)
-    rng = np.random.RandomState(42)
-    v_arr = rng.randn(len(phi_hat.x.array))
-    # Zero v on BC DOFs
+    # 4) Build random direction v (distributed, owned DOFs only)
+    v_fun = fem.Function(V)
+    rng = np.random.default_rng(seed=42 + comm.rank)
+    v_fun.x.array[:n_owned] = rng.standard_normal(n_owned)
+    # Zero v on BC DOFs so perturbation respects BCs
     for bc in bcs:
         bc_dofs = bc.dof_indices()[0]
-        v_arr[bc_dofs] = 0.0
+        owned_bc = bc_dofs[bc_dofs < n_owned]
+        v_fun.x.array[owned_bc] = 0.0
+    v_fun.x.scatter_forward()
 
-    v_vec = phi_hat.x.petsc_vec.duplicate()
-    v_vec.array[:len(v_arr)] = v_arr
-    v_vec.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
+    # 5) Compute J(u)*v
+    Jv_fun = fem.Function(V)
+    A.mult(v_fun.x.petsc_vec, Jv_fun.x.petsc_vec)
 
-    # Compute J(u)*v
-    Jv = phi_hat.x.petsc_vec.duplicate()
-    A.mult(v_vec, Jv)
-
-    # Perturb: u_pert = u + eps*v
-    u_save = phi_hat.x.array.copy()
-    phi_hat.x.array[:] = u_save + eps * v_arr
+    # 6) Perturb state: u_pert = u + eps*v
+    phi_hat.x.array[:n_owned] = u0 + eps * v_fun.x.array[:n_owned]
     phi_hat.x.scatter_forward()
 
-    # Evaluate F(u + eps*v)
-    F1 = phi_hat.x.petsc_vec.duplicate()
-    with F1.localForm() as f_local:
-        f_local.set(0.0)
-    fem_petsc.assemble_vector(F1, F_compiled)
-    fem_petsc.apply_lifting(F1, [J_compiled], bcs=[bcs],
-                            x0=[phi_hat.x.petsc_vec], alpha=-1.0)
-    F1.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-    fem_petsc.set_bc(F1, bcs, phi_hat.x.petsc_vec)
+    # 7) Assemble F(u + eps*v)
+    F1_fun = assemble_F_vec()
 
-    # Restore phi_hat
-    phi_hat.x.array[:] = u_save
+    # 8) Restore state immediately
+    phi_hat.x.array[:n_owned] = u0
     phi_hat.x.scatter_forward()
 
-    # Compute |F1 - F0 - eps*Jv| / (eps * |Jv|)
-    diff = F1.duplicate()
-    F1.copy(diff)
-    diff.axpy(-1.0, F0)       # diff = F1 - F0
-    diff.axpy(-eps, Jv)       # diff = F1 - F0 - eps*Jv
-    err_norm = diff.norm()
-    Jv_norm = Jv.norm()
+    # 9) Form difference: dF = F1 - F0 - eps*Jv (using PETSc Vec ops)
+    dF = F1_fun.x.petsc_vec.copy()
+    dF.axpy(-1.0, F0_fun.x.petsc_vec)   # dF = F1 - F0
+    dF.axpy(-eps, Jv_fun.x.petsc_vec)   # dF = (F1 - F0) - eps*Jv
 
+    # 10) Norm ratio (PETSc norms are already global/MPI-reduced)
+    err_norm = dF.norm()
+    Jv_norm = Jv_fun.x.petsc_vec.norm()
+    F0_norm = F0_fun.x.petsc_vec.norm()
+    F1_norm = F1_fun.x.petsc_vec.norm()
     rel_err = err_norm / max(eps * Jv_norm, 1e-30)
 
     if comm.rank == 0:
         print(f"\n=== JACOBIAN CONSISTENCY TEST ===")
         print(f"  eps             = {eps:.1e}")
-        print(f"  ||F(u)||        = {F0.norm():.6e}")
-        print(f"  ||F(u+eps*v)||  = {F1.norm():.6e}")
+        print(f"  ||F(u)||        = {F0_norm:.6e}")
+        print(f"  ||F(u+eps*v)||  = {F1_norm:.6e}")
         print(f"  ||J(u)*v||      = {Jv_norm:.6e}")
         print(f"  ||F1-F0-eps*Jv||= {err_norm:.6e}")
         print(f"  Relative error  = {rel_err:.6e}")
         if rel_err < 1e-3:
             print(f"  PASSED (Jacobian consistent with residual)")
         else:
-            print(f"  *** FAILED *** (Jacobian inconsistent — check signs/forms)")
+            print(f"  *** FAILED *** (Jacobian inconsistent)")
         print(f"================================\n", flush=True)
 
-    # Cleanup
-    for vec in [F0, F1, Jv, diff, v_vec]:
-        vec.destroy()
+    dF.destroy()
     A.destroy()
 
     return rel_err
