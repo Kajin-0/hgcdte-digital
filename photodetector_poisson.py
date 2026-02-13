@@ -881,8 +881,15 @@ def build_nonlinear_poisson(msh, scaling, dims, V_bias, Nd, Na, n_i,
     rho_dop = fem.Constant(msh, PETSc.ScalarType((Nd - Na) / scaling.n_ref))
 
     # Boltzmann carriers (overflow-protected)
-    n_hat = _safe_exp(+(phi_hat - phi_ref))    # electrons
-    p_hat = _safe_exp(-(phi_hat - phi_ref))    # holes
+    # Physical: n/n_ref = (n_i/n_ref) * exp(phi_hat)
+    #           p/n_ref = (n_i/n_ref) * exp(-phi_hat)
+    # Shifted:  n/n_ref = (n_i/n_ref) * exp(phi_ref) * exp(phi_hat - phi_ref)
+    #           p/n_ref = (n_i/n_ref) * exp(-phi_ref) * exp(-(phi_hat - phi_ref))
+    # We absorb exp(+-phi_ref) into the prefactors so physics is preserved.
+    exp_phi_ref_pos = ufl.exp(phi_ref)    # = exp(phi_ref_hat_value)
+    exp_phi_ref_neg = ufl.exp(-phi_ref)   # = exp(-phi_ref_hat_value)
+    n_hat = exp_phi_ref_pos * _safe_exp(+(phi_hat - phi_ref))    # = exp(phi_hat)
+    p_hat = exp_phi_ref_neg * _safe_exp(-(phi_hat - phi_ref))    # = exp(-phi_hat)
 
     # Total dimensionless charge: ρ̂_total = ρ̂_doping + (n_i/n_ref)(p̂ − n̂)
     rho_total = rho_dop + ni_ratio * (p_hat - n_hat)
@@ -1125,6 +1132,99 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     return info
 
 
+def check_jacobian_consistency(F_form, J_form, phi_hat, bcs, comm, eps=1e-7):
+    """
+    Directional derivative test: verify J is the derivative of F.
+
+    Computes: |F(u + eps*v) - F(u) - eps*J(u)*v| / (eps * |J(u)*v|)
+    Should be << 1 (typically 1e-4 to 1e-6).
+    """
+    F_compiled = fem.form(F_form)
+    J_compiled = fem.form(J_form)
+
+    # Evaluate F(u)
+    F0 = phi_hat.x.petsc_vec.duplicate()
+    with F0.localForm() as f_local:
+        f_local.set(0.0)
+    fem_petsc.assemble_vector(F0, F_compiled)
+    fem_petsc.apply_lifting(F0, [J_compiled], bcs=[bcs],
+                            x0=[phi_hat.x.petsc_vec], alpha=-1.0)
+    F0.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+    fem_petsc.set_bc(F0, bcs, phi_hat.x.petsc_vec)
+
+    # Assemble J(u)
+    A = fem_petsc.create_matrix(J_compiled)
+    A.zeroEntries()
+    fem_petsc.assemble_matrix(A, J_compiled, bcs=bcs)
+    A.assemble()
+
+    # Random direction v (seeded for reproducibility)
+    rng = np.random.RandomState(42)
+    v_arr = rng.randn(len(phi_hat.x.array))
+    # Zero v on BC DOFs
+    for bc in bcs:
+        bc_dofs = bc.dof_indices()[0]
+        v_arr[bc_dofs] = 0.0
+
+    v_vec = phi_hat.x.petsc_vec.duplicate()
+    v_vec.array[:len(v_arr)] = v_arr
+    v_vec.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
+
+    # Compute J(u)*v
+    Jv = phi_hat.x.petsc_vec.duplicate()
+    A.mult(v_vec, Jv)
+
+    # Perturb: u_pert = u + eps*v
+    u_save = phi_hat.x.array.copy()
+    phi_hat.x.array[:] = u_save + eps * v_arr
+    phi_hat.x.scatter_forward()
+
+    # Evaluate F(u + eps*v)
+    F1 = phi_hat.x.petsc_vec.duplicate()
+    with F1.localForm() as f_local:
+        f_local.set(0.0)
+    fem_petsc.assemble_vector(F1, F_compiled)
+    fem_petsc.apply_lifting(F1, [J_compiled], bcs=[bcs],
+                            x0=[phi_hat.x.petsc_vec], alpha=-1.0)
+    F1.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+    fem_petsc.set_bc(F1, bcs, phi_hat.x.petsc_vec)
+
+    # Restore phi_hat
+    phi_hat.x.array[:] = u_save
+    phi_hat.x.scatter_forward()
+
+    # Compute |F1 - F0 - eps*Jv| / (eps * |Jv|)
+    diff = F1.duplicate()
+    F1.copy(diff)
+    diff.axpy(-1.0, F0)       # diff = F1 - F0
+    diff.axpy(-eps, Jv)       # diff = F1 - F0 - eps*Jv
+    err_norm = diff.norm()
+    Jv_norm = Jv.norm()
+
+    rel_err = err_norm / max(eps * Jv_norm, 1e-30)
+
+    if comm.rank == 0:
+        print(f"\n=== JACOBIAN CONSISTENCY TEST ===")
+        print(f"  eps             = {eps:.1e}")
+        print(f"  ||F(u)||        = {F0.norm():.6e}")
+        print(f"  ||F(u+eps*v)||  = {F1.norm():.6e}")
+        print(f"  ||J(u)*v||      = {Jv_norm:.6e}")
+        print(f"  ||F1-F0-eps*Jv||= {err_norm:.6e}")
+        print(f"  Relative error  = {rel_err:.6e}")
+        if rel_err < 1e-3:
+            print(f"  PASSED (Jacobian consistent with residual)")
+        else:
+            print(f"  *** FAILED *** (Jacobian inconsistent — check signs/forms)")
+        print(f"================================\n", flush=True)
+
+    # Cleanup
+    for vec in [F0, F1, Jv, diff, v_vec]:
+        vec.destroy()
+    A.destroy()
+
+    return rel_err
+
+
 def run_nonlinear_poisson(args, comm, rank):
     """Run Brick 3: semi-linear Poisson with Boltzmann carriers."""
     scaling = make_mct_scaling_77K()
@@ -1161,10 +1261,19 @@ def run_nonlinear_poisson(args, comm, rank):
         print(f"  φ̂_ref (overflow shift) = {phi_ref_val:.4f}")
         print(f"  DOFs = {V.dofmap.index_map.size_global}")
 
-    info = solve_nonlinear_poisson(
-        F_form, J_form, phi_hat, bcs, comm,
-        phi_ref_hat_value=phi_ref_val, verbose=True
-    )
+    # Gate A: Jacobian consistency test (MANDATORY before trusting Newton)
+    check_jacobian_consistency(F_form, J_form, phi_hat, bcs, comm)
+
+    # Solve (catch divergence so we still get diagnostics)
+    try:
+        info = solve_nonlinear_poisson(
+            F_form, J_form, phi_hat, bcs, comm,
+            phi_ref_hat_value=phi_ref_val, verbose=True
+        )
+    except PoissonSolveError as e:
+        if rank == 0:
+            print(f"  SNES solve failed: {e}")
+        return None
 
     # Physical output
     if rank == 0:
