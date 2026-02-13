@@ -959,8 +959,8 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     J_compiled = fem.form(J_form)
 
     # --- Allocate residual vector and Jacobian matrix ---
-    # Create vector matching the form's index map (correct ghost structure)
-    b_vec = fem.Function(phi_hat.function_space).x.petsc_vec.copy()
+    # duplicate() creates a new Vec with identical layout (size, ghosts, comm)
+    b_vec = phi_hat.x.petsc_vec.duplicate()
     A_mat = fem_petsc.create_matrix(J_compiled)
 
     # --- SNES residual callback ---
