@@ -252,59 +252,81 @@ def build_poisson_system(msh, scaling, dims, V_bias, rho_hat_expr=None):
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  4.  MMS VALIDATION  — manufactured solution test
+#  4.  MMS VALIDATION  — manufactured solution test (trigonometric)
 # ════════════════════════════════════════════════════════════════════════
+#
+#  Exact solution (3D product of sines, NOT representable in P1):
+#    phi_exact(x,y,z) = sin(pi x/Lx) * sin(pi y/Ly) * sin(pi z/Lz)
+#
+#  Laplacian:
+#    lap = -(pi/Lx)^2 * phi - (pi/Ly)^2 * phi - (pi/Lz)^2 * phi
+#        = -[(pi/Lx)^2 + (pi/Ly)^2 + (pi/Lz)^2] * phi
+#
+#  So rho_hat = -lap / alpha_eff  =  [(pi/Lx)^2+...] * phi / alpha_eff
+#
+#  BCs: phi_exact = 0 on ALL boundaries (sin vanishes at 0 and L).
 
-def mms_exact_solution(x):
-    """Manufactured exact solution: φ̂_exact = x̂²"""
-    return x[0]**2
-
-
-def mms_rhs_charge(alpha_eff):
-    """For φ̂ = x̂², ∇̂²φ̂ = 2, so ρ̂ = -2/α_eff"""
-    return lambda x: np.full(x.shape[1], -2.0 / alpha_eff)
+MMS_QUAD_DEGREE = 6  # quadrature degree for trig MMS (avoid quadrature error)
 
 
 def build_mms_system(msh, scaling, dims):
     """
     Assemble MMS test system with full Dirichlet BCs.
-    
-    Exact solution: φ̂ = x̂²
-    Strong form: ∇̂²φ̂ = 2 = -α_eff * ρ̂  →  ρ̂ = -2/α_eff
-    
-    Returns (V, A, b, bcs, phi_hat, phi_exact).
+
+    Exact solution: phi_exact = sin(pi x/Lx) sin(pi y/Ly) sin(pi z/Lz)
+    BCs: phi = 0 on all boundaries (homogeneous Dirichlet).
+    RHS derived from strong form so that the weak form is exactly consistent.
+
+    Returns (V, A, b, bcs, phi_hat, phi_exact_fn).
     """
     V = fem.functionspace(msh, ("Lagrange", 1))
     phi_hat = fem.Function(V, name="phi_hat")
-    phi_exact = fem.Function(V, name="phi_exact")
-    phi_exact.interpolate(mms_exact_solution)
-    
+
     u = ufl.TrialFunction(V)
     v = ufl.TestFunction(V)
 
-    # --- LHS ---
-    a_form = ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx
+    # Domain extents in dimensionless coordinates
+    Lx = dims["Lx_hat"]
+    Ly = dims["Ly_hat"]
+    Lz = dims["Lz_hat"]
 
-    # --- RHS ---
+    # Physics scaling
     L_norm = dims["L_norm"]
     L_ref = dims["L_ref"]
     alpha_eff = scaling.alpha * (L_ref / L_norm)**2
-    
-    rho_fn = fem.Function(V, name="rho_hat")
-    rho_fn.interpolate(mms_rhs_charge(alpha_eff))
-    L_form = fem.Constant(msh, PETSc.ScalarType(alpha_eff)) * rho_fn * v * ufl.dx
 
-    # --- Full Dirichlet BCs on all boundaries ---
+    # --- Exact solution as UFL expression ---
+    x = ufl.SpatialCoordinate(msh)
+    pi = np.pi
+    phi_exact_ufl = (ufl.sin(pi * x[0] / Lx)
+                     * ufl.sin(pi * x[1] / Ly)
+                     * ufl.sin(pi * x[2] / Lz))
+
+    # --- RHS from strong form ---
+    # lap(phi) = -[(pi/Lx)^2 + (pi/Ly)^2 + (pi/Lz)^2] * phi_exact
+    # We need: a(u,v) = L(v)  =>  int grad(u).grad(v) dx = alpha_eff * int rho_hat * v dx
+    # Strong form: -lap(phi) = -alpha_eff * rho_hat  =>  rho_hat = lap(phi) / alpha_eff
+    # Actually: div(grad(phi_exact_ufl)) gives the Laplacian in UFL.
+    # The weak form is: int grad(phi).grad(v) dx = int f * v dx
+    #   where f = -lap(phi_exact) = -div(grad(phi_exact))
+    # And we assemble RHS as: int alpha_eff * rho_hat * v dx
+    #   so rho_hat = f / alpha_eff = -div(grad(phi_exact)) / alpha_eff
+    #
+    # For cleanliness: f = -div(grad(phi_exact_ufl)), then L = f * v * dx
+    f_ufl = -ufl.div(ufl.grad(phi_exact_ufl))
+
+    # --- Forms with elevated quadrature ---
+    dx_mms = ufl.dx(metadata={"quadrature_degree": MMS_QUAD_DEGREE})
+    a_form = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_mms
+    L_form = f_ufl * v * dx_mms
+
+    # --- BCs: homogeneous Dirichlet (phi_exact = 0 on all boundaries) ---
     tdim = msh.topology.dim
     fdim = tdim - 1
-    
-    # Locate all boundary facets
     msh.topology.create_connectivity(fdim, tdim)
     boundary_facets = dmesh.exterior_facet_indices(msh.topology)
     boundary_dofs = fem.locate_dofs_topological(V, fdim, boundary_facets)
-    
-    # Apply exact solution on boundary
-    bc = fem.dirichletbc(phi_exact, boundary_dofs)
+    bc = fem.dirichletbc(PETSc.ScalarType(0.0), boundary_dofs, V)
     bcs = [bc]
 
     # --- Compile & assemble ---
@@ -319,30 +341,54 @@ def build_mms_system(msh, scaling, dims):
     b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
     fem_petsc.set_bc(b, bcs)
 
-    return V, A, b, bcs, phi_hat, phi_exact
+    # --- Interpolate exact solution into V for error computation ---
+    phi_exact_fn = fem.Function(V, name="phi_exact")
+
+    def _phi_exact_numpy(x):
+        return (np.sin(pi * x[0] / Lx)
+                * np.sin(pi * x[1] / Ly)
+                * np.sin(pi * x[2] / Lz))
+
+    phi_exact_fn.interpolate(_phi_exact_numpy)
+
+    return V, A, b, bcs, phi_hat, phi_exact_fn
 
 
-def compute_errors(phi_h, phi_exact, comm):
+def compute_errors(phi_h, phi_exact_fn, msh, dims, comm):
     """
-    Compute L2 and H1 seminorm errors.
-    
+    Compute L2 and H1 seminorm errors using elevated quadrature.
+
+    Uses the UFL exact expression (not the interpolated function) for
+    high-accuracy error integration via SpatialCoordinate.
+
     Returns (L2_error, H1_seminorm_error).
     """
-    # Error function
-    e_h = phi_h - phi_exact
-    
-    # L2 error: ||e||_L2 = sqrt(∫ e² dx)
-    L2_form = fem.form(e_h**2 * ufl.dx)
+    Lx = dims["Lx_hat"]
+    Ly = dims["Ly_hat"]
+    Lz = dims["Lz_hat"]
+    pi = np.pi
+
+    x = ufl.SpatialCoordinate(msh)
+    phi_exact_ufl = (ufl.sin(pi * x[0] / Lx)
+                     * ufl.sin(pi * x[1] / Ly)
+                     * ufl.sin(pi * x[2] / Lz))
+
+    dx_err = ufl.dx(metadata={"quadrature_degree": MMS_QUAD_DEGREE})
+
+    # L2 error: ||phi_h - phi_exact||_L2
+    e = phi_h - phi_exact_ufl
+    L2_form = fem.form(e**2 * dx_err)
     L2_local = fem.assemble_scalar(L2_form)
     L2_global = comm.allreduce(L2_local, op=MPI.SUM)
-    L2_error = np.sqrt(L2_global)
-    
-    # H1 seminorm: ||∇e||_L2 = sqrt(∫ |∇e|² dx)
-    H1_form = fem.form(ufl.inner(ufl.grad(e_h), ufl.grad(e_h)) * ufl.dx)
+    L2_error = np.sqrt(abs(L2_global))
+
+    # H1 seminorm: ||grad(phi_h - phi_exact)||_L2
+    grad_e = ufl.grad(phi_h) - ufl.grad(phi_exact_ufl)
+    H1_form = fem.form(ufl.inner(grad_e, grad_e) * dx_err)
     H1_local = fem.assemble_scalar(H1_form)
     H1_global = comm.allreduce(H1_local, op=MPI.SUM)
-    H1_seminorm = np.sqrt(H1_global)
-    
+    H1_seminorm = np.sqrt(abs(H1_global))
+
     return L2_error, H1_seminorm
 
 
@@ -437,58 +483,60 @@ def solve_poisson(A, b, phi, cfg=SolverConfig(), comm=MPI.COMM_WORLD) -> SolveRe
 
 def run_mms_convergence_test(base_nx=5, base_ny=15, base_nz=10, n_levels=3):
     """
-    Run MMS convergence test with mesh refinement.
-    
+    Run MMS convergence test with trigonometric exact solution.
+
+    phi_exact = sin(pi x/Lx) sin(pi y/Ly) sin(pi z/Lz)
+
     Expected convergence rates for P1 elements:
-    - L2 error: O(h²) → rate ≈ 2.0
-    - H1 seminorm: O(h) → rate ≈ 1.0
-    
+    - L2 error: O(h^2) -> rate ~ 2.0
+    - H1 seminorm: O(h) -> rate ~ 1.0
+
     Exits with code 1 if convergence rates are outside tolerance.
     """
     comm = MPI.COMM_WORLD
     rank = comm.rank
-    
+
     scaling = make_mct_scaling_77K()
     geom = DeviceGeometry()
-    
+
     if rank == 0:
         print("\n" + "="*70)
-        print("MMS CONVERGENCE TEST: φ̂_exact = x̂²")
+        print("MMS CONVERGENCE TEST: phi_exact = sin(pi x/Lx)*sin(pi y/Ly)*sin(pi z/Lz)")
         print("="*70)
         print(scaling.summary())
         print()
-    
+
     results = []
-    
+
     for level in range(n_levels):
         factor = 2**level
         nx = base_nx * factor
         ny = base_ny * factor
         nz = base_nz * factor
-        
+
         mcfg = MeshConfig(nx=nx, ny=ny, nz=nz)
-        
+
         # Create mesh
         msh, dims = create_device_mesh(geom, scaling.L_ref, mcfg, comm)
-        
+
         # Compute mesh size h (characteristic element size) - use max for anisotropic domains
         hx = dims["Lx_hat"] / nx
         hy = dims["Ly_hat"] / ny
         hz = dims["Lz_hat"] / nz
         h = max(hx, hy, hz)  # in normalized coordinates
-        
+
         # Build MMS system
-        V, A, b, bcs, phi_hat, phi_exact = build_mms_system(msh, scaling, dims)
-        
+        V, A, b, bcs, phi_hat, phi_exact_fn = build_mms_system(msh, scaling, dims)
+
         ndofs = V.dofmap.index_map.size_global
-        
+
         # Solve
         t0 = time.perf_counter()
         result = solve_poisson(A, b, phi_hat, SolverConfig(), comm)
         t_solve = time.perf_counter() - t0
-        
-        # Compute errors
-        L2_err, H1_err = compute_errors(phi_hat, phi_exact, comm)
+
+        # Compute errors (using UFL exact expression, elevated quadrature)
+        L2_err, H1_err = compute_errors(phi_hat, phi_exact_fn, msh, dims, comm)
         
         results.append({
             'level': level,
@@ -531,6 +579,16 @@ def run_mms_convergence_test(base_nx=5, base_ny=15, base_nz=10, n_levels=3):
         
         # Check final convergence rate (average of last 2 refinements)
         if n_levels >= 3:
+            # Roundoff guard: if finest error is < 1e-12, rates are meaningless
+            finest_L2 = results[-1]['L2']
+            finest_H1 = results[-1]['H1']
+            if finest_L2 < 1e-12 or finest_H1 < 1e-12:
+                print("\n*** ROUNDOFF DOMINATED: finest L2={:.2e}, H1={:.2e} ***".format(
+                    finest_L2, finest_H1))
+                print("*** MMS not informative at this resolution. ***")
+                print("*** Reporting PASS (solver is exact to roundoff). ***")
+                return 0
+
             L2_rates = []
             H1_rates = []
             for i in range(1, n_levels):
@@ -845,8 +903,12 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
 
     Returns dict with convergence info + clamp diagnostics.
     """
-    # DOLFINx 0.10 API: NonlinearProblem stores forms, NewtonSolver drives SNES
-    problem = fem_petsc.NonlinearProblem(F_form, phi_hat, bcs=bcs, J=J_form)
+    # DOLFINx 0.10 API: NonlinearProblem requires petsc_options_prefix
+    NLP_PREFIX = "nlp_"
+    problem = fem_petsc.NonlinearProblem(
+        F_form, phi_hat, bcs=bcs, J=J_form,
+        petsc_options_prefix=NLP_PREFIX,
+    )
     solver = dolfinx.nls.petsc.NewtonSolver(comm, problem)
 
     # Newton parameters — use RESIDUAL criterion so we converge on |F|, not |du|
@@ -855,15 +917,15 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     solver.max_it = max_newton
     solver.convergence_criterion = "residual"
 
-    # KSP for linear sub-problems (accessed via the underlying SNES)
+    # KSP for linear sub-problems — use prefixed options to avoid global collisions
     ksp = solver.krylov_solver
     opts = PETSc.Options()
-    opts["ksp_type"] = "cg"
-    opts["ksp_rtol"] = 1e-9
-    opts["ksp_atol"] = 1e-12
-    opts["ksp_max_it"] = 1000
-    opts["pc_type"] = "hypre"
-    opts["pc_hypre_type"] = "boomeramg"
+    opts[f"{NLP_PREFIX}ksp_type"] = "cg"
+    opts[f"{NLP_PREFIX}ksp_rtol"] = 1e-9
+    opts[f"{NLP_PREFIX}ksp_atol"] = 1e-12
+    opts[f"{NLP_PREFIX}ksp_max_it"] = 1000
+    opts[f"{NLP_PREFIX}pc_type"] = "hypre"
+    opts[f"{NLP_PREFIX}pc_hypre_type"] = "boomeramg"
     ksp.setFromOptions()
 
     # Logging callback
