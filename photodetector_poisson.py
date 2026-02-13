@@ -1019,11 +1019,18 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     snes.setType("newtonls")
     snes.setTolerances(rtol=snes_rtol, atol=snes_atol, max_it=max_newton)
 
-    # Line search: basic (full Newton step) — the linear Poisson initial guess
-    # is typically so close that backtracking causes spurious failures.
-    # Use -snes_linesearch_type bt on CLI to switch to backtracking if needed.
+    # Line search: backtracking (bt) to prevent catastrophic full Newton steps
+    # in stiff regimes. bt will reduce step length until ||F|| decreases.
     ls = snes.getLineSearch()
-    ls.setType("basic")
+    ls.setType("bt")
+
+    # Increase SNES divergence tolerance: default dtol=1e4 is too tight for
+    # stiff problems where early iterations may temporarily increase ||F||.
+    snes.setTolerances(rtol=snes_rtol, atol=snes_atol,
+                       stol=1e-8, max_it=max_newton)
+    # Set dtol separately (PETSc default 1e4 may trigger DIVERGED_DTOL too early)
+    opts = PETSc.Options()
+    opts["snes_divergence_tolerance"] = 1e10
 
     # KSP: GMRES + AMG (GMRES safer than CG for non-SPD Jacobians)
     ksp = snes.getKSP()
@@ -1033,16 +1040,33 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     pc.setType("hypre")
     pc.setHYPREType("boomeramg")
 
-    # Built-in monitor (always on when verbose; PETSc monitors add on top)
-    if verbose and comm.rank == 0:
-        snes.setMonitor(
-            lambda s, it, fnorm: print(
-                f"  SNES iter {it:3d} | ||F|| = {fnorm:.6e}", flush=True
-            )
-        )
+    # Built-in monitor with Newton step diagnostic
+    _prev_x = [phi_hat.x.petsc_vec.copy()]  # mutable container for closure
+
+    def _snes_monitor(snes_obj, it, fnorm):
+        if it > 0 and comm.rank == 0:
+            # Compute Newton step magnitude: du = x_new - x_old
+            x_new = snes_obj.getSolution()
+            du = x_new.copy()
+            du.axpy(-1.0, _prev_x[0])
+            n_own = phi_hat.function_space.dofmap.index_map.size_local
+            du_local = du.array[:n_own]
+            du_inf_local = np.max(np.abs(du_local)) if n_own > 0 else 0.0
+            du_inf = comm.allreduce(du_inf_local, op=MPI.MAX)
+            du_l2 = du.norm()
+            print(f"  SNES iter {it:3d} | ||F|| = {fnorm:.6e} | "
+                  f"||du||_inf = {du_inf:.4f} | ||du||_2 = {du_l2:.4e}",
+                  flush=True)
+            du.destroy()
+        elif comm.rank == 0:
+            print(f"  SNES iter {it:3d} | ||F|| = {fnorm:.6e}", flush=True)
+        # Save current solution for next iteration's du computation
+        snes_obj.getSolution().copy(_prev_x[0])
+
+    if verbose:
+        snes.setMonitor(_snes_monitor)
 
     # CRITICAL: setFromOptions AFTER all programmatic config but BEFORE solve.
-    # This lets CLI flags like -snes_monitor, -ksp_monitor override/augment.
     snes.setFromOptions()
     ksp.setFromOptions()
 
@@ -1050,7 +1074,8 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     if comm.rank == 0:
         rtol_s, atol_s, stol_s, max_it_s = snes.getTolerances()
         print(f"  [SNES config] type={snes.getType()} max_it={max_it_s} "
-              f"rtol={rtol_s:.1e} atol={atol_s:.1e}", flush=True)
+              f"rtol={rtol_s:.1e} atol={atol_s:.1e} "
+              f"ls={ls.getType()}", flush=True)
         print(f"  [KSP  config] type={ksp.getType()} "
               f"pc={pc.getType()}", flush=True)
 
@@ -1129,6 +1154,7 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
             print(f"  *** WARNING: >1% DOFs clamped -- solution may be physically nonsense ***")
         print(f"====================\n")
 
+    _prev_x[0].destroy()
     snes.destroy()
 
     if not converged:
@@ -1374,6 +1400,95 @@ def run_nonlinear_bias_sweep(args, comm, rank):
 #  11.  MAIN DRIVER
 # ════════════════════════════════════════════════════════════════════════
 
+def run_nd_continuation(args, comm, rank):
+    """
+    Brick 3 continuation: ramp Nd from 1e18 to target in log steps.
+
+    Each step rebuilds the nonlinear system at the new Nd but uses the
+    previous converged solution as the initial guess, giving Newton a
+    much better starting point for stiff regimes.
+    """
+    import math
+
+    scaling = make_mct_scaling_77K()
+    geom = DeviceGeometry()
+    mcfg = MeshConfig(nx=args.nx, ny=args.ny, nz=args.nz)
+
+    Nd_target = args.Nd
+    if Nd_target <= 0:
+        if rank == 0:
+            print("ERROR: --Nd must be > 0 for continuation")
+        return
+
+    # Build continuation schedule: log-spaced from 1e18 to Nd_target
+    Nd_start = 1e18
+    if Nd_target <= Nd_start:
+        Nd_schedule = [Nd_target]
+    else:
+        n_steps = max(2, int(math.log10(Nd_target / Nd_start) * 3))  # ~3 steps per decade
+        Nd_schedule = np.logspace(math.log10(Nd_start), math.log10(Nd_target), n_steps)
+    Nd_schedule = list(Nd_schedule)
+
+    if rank == 0:
+        print("\n" + "="*70)
+        print("BRICK 3: Nd CONTINUATION")
+        print("="*70)
+        print(scaling.summary())
+        print(f"  V_bias = {args.V_bias} V")
+        print(f"  Na     = {args.Na:.3e} m^-3")
+        print(f"  n_i    = {args.n_i:.3e} m^-3")
+        print(f"  Nd schedule ({len(Nd_schedule)} steps):")
+        for i, Nd in enumerate(Nd_schedule):
+            print(f"    [{i}] Nd = {Nd:.3e} m^-3")
+        print()
+
+    msh, dims = create_device_mesh(geom, scaling.L_ref, mcfg, comm)
+
+    # Initial guess: start from linear Poisson solution at first Nd
+    prev_phi_array = None
+
+    if rank == 0:
+        print(f"{'Step':<6} {'Nd':>12} {'Nd/n_ref':>12} {'||F0||':>12} "
+              f"{'Iters':>6} {'||F_final||':>12} {'Reason':>12}")
+        print("-" * 78)
+
+    for step_idx, Nd_val in enumerate(Nd_schedule):
+        # Build system at this Nd
+        V, F_form, J_form, bcs, phi_hat, phi_ref_val = build_nonlinear_poisson(
+            msh, scaling, dims, args.V_bias, Nd_val, args.Na, args.n_i
+        )
+
+        # Override initial guess with previous converged solution
+        if prev_phi_array is not None:
+            n_own = V.dofmap.index_map.size_local
+            phi_hat.x.array[:n_own] = prev_phi_array[:n_own]
+            phi_hat.x.scatter_forward()
+
+        # Skip Jacobian test for continuation (already validated)
+        try:
+            info = solve_nonlinear_poisson(
+                F_form, J_form, phi_hat, bcs, comm,
+                phi_ref_hat_value=phi_ref_val, verbose=(rank == 0),
+            )
+            n_own = V.dofmap.index_map.size_local
+            prev_phi_array = phi_hat.x.array[:n_own].copy()
+
+            if rank == 0:
+                print(f"{step_idx:<6} {Nd_val:>12.3e} {Nd_val/scaling.n_ref:>12.3e} "
+                      f"{'--':>12} {info['newton_iters']:>6} "
+                      f"{info['fnorm']:>12.3e} {info['reason_str']:>12}")
+
+        except PoissonSolveError as e:
+            if rank == 0:
+                print(f"{step_idx:<6} {Nd_val:>12.3e} {Nd_val/scaling.n_ref:>12.3e} "
+                      f"{'--':>12} {'FAIL':>6} {'--':>12} {'DIVERGED':>12}")
+                print(f"  Continuation stopped at Nd = {Nd_val:.3e}: {e}")
+            return
+
+    if rank == 0:
+        print("\n  Continuation COMPLETE — all Nd steps converged.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="MCT Photoconductor Poisson (Bricks 1-3)",
@@ -1409,6 +1524,8 @@ def main():
                         help="Brick 3: Semi-linear Poisson with Boltzmann carriers")
     parser.add_argument("--nl_sweep", action="store_true",
                         help="Brick 3: Bias sweep for nonlinear Poisson")
+    parser.add_argument("--nd_continuation", action="store_true",
+                        help="Brick 3: Ramp Nd from 1e18 to --Nd with continuation")
     parser.add_argument("--n_i", type=float, default=N_I_DEFAULT,
                         help="Intrinsic carrier density [m^-3]")
 
@@ -1435,6 +1552,11 @@ def main():
     # ── Brick 3: Nonlinear single point ──
     if args.nonlinear:
         run_nonlinear_poisson(args, comm, rank)
+        sys.exit(0)
+
+    # ── Brick 3: Nd continuation ──
+    if args.nd_continuation:
+        run_nd_continuation(args, comm, rank)
         sys.exit(0)
 
     # ── Brick 3: Nonlinear bias sweep ──
