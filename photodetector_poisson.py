@@ -70,7 +70,6 @@ import dolfinx.fem as fem
 import dolfinx.fem.petsc as fem_petsc
 import dolfinx.mesh as dmesh
 import dolfinx.io
-import dolfinx.nls.petsc
 import ufl
 
 # ════════════════════════════════════════════════════════════════════════
@@ -896,44 +895,74 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
                             max_newton=50, snes_rtol=1e-8, snes_atol=1e-10,
                             verbose=True):
     """
-    Solve F(phi_hat) = 0 using DOLFINx 0.10 NewtonSolver (PETSc SNES).
+    Solve F(phi_hat) = 0 using raw PETSc SNES (no dolfinx.nls.petsc.NewtonSolver).
 
-    Uses residual-based convergence criterion (not incremental).
-    Reports exp-argument clamp diagnostics after solve.
+    Uses fem_petsc.NonlinearProblem for residual/Jacobian assembly,
+    then drives PETSc SNES directly for maximum DOLFINx 0.10 compatibility.
 
+    Reports SNES convergence, exp-argument clamp diagnostics.
     Returns dict with convergence info + clamp diagnostics.
     """
-    # DOLFINx 0.10 API: NonlinearProblem requires petsc_options_prefix
-    NLP_PREFIX = "nlp_"
+    # --- Build NonlinearProblem (assembles F and J) ---
+    NL_PREFIX = "nl_"
     problem = fem_petsc.NonlinearProblem(
         F_form, phi_hat, bcs=bcs, J=J_form,
-        petsc_options_prefix=NLP_PREFIX,
+        petsc_options_prefix=NL_PREFIX,
     )
-    solver = dolfinx.nls.petsc.NewtonSolver(comm, problem)
 
-    # Newton parameters — use RESIDUAL criterion so we converge on |F|, not |du|
-    solver.atol = snes_atol
-    solver.rtol = snes_rtol
-    solver.max_it = max_newton
-    solver.convergence_criterion = "residual"
+    # --- Create raw PETSc SNES ---
+    snes = PETSc.SNES().create(comm)
+    snes.setOptionsPrefix(NL_PREFIX)
 
-    # KSP for linear sub-problems — use prefixed options to avoid global collisions
-    ksp = solver.krylov_solver
-    opts = PETSc.Options()
-    opts[f"{NLP_PREFIX}ksp_type"] = "cg"
-    opts[f"{NLP_PREFIX}ksp_rtol"] = 1e-9
-    opts[f"{NLP_PREFIX}ksp_atol"] = 1e-12
-    opts[f"{NLP_PREFIX}ksp_max_it"] = 1000
-    opts[f"{NLP_PREFIX}pc_type"] = "hypre"
-    opts[f"{NLP_PREFIX}pc_hypre_type"] = "boomeramg"
-    ksp.setFromOptions()
+    # Wire residual and Jacobian from NonlinearProblem
+    snes.setFunction(problem.F, problem.b)
+    snes.setJacobian(problem.J, problem.A)
 
-    # Logging callback
-    solver.report = verbose
+    # SNES parameters
+    snes.setType("newtonls")
+    snes.setTolerances(rtol=snes_rtol, atol=snes_atol, max_it=max_newton)
 
+    # Line search: backtracking for robustness
+    ls = snes.getLineSearch()
+    ls.setType("bt")
+
+    # KSP for linear sub-problems (GMRES safer than CG for non-SPD Jacobians)
+    ksp = snes.getKSP()
+    ksp.setType("gmres")
+    ksp.setTolerances(rtol=1e-9, atol=1e-12, max_it=1000)
+    pc = ksp.getPC()
+    pc.setType("hypre")
+    pc.setHYPREType("boomeramg")
+
+    # Allow PETSc command-line overrides with prefix
+    snes.setFromOptions()
+
+    # Monitor (optional)
+    if verbose and comm.rank == 0:
+        snes.setMonitor(
+            lambda snes_obj, it, fnorm: print(
+                f"  SNES iter {it:3d} | ||F|| = {fnorm:.6e}"
+            )
+        )
+
+    # --- Solve ---
     t0 = time.perf_counter()
-    n_iters, converged = solver.solve(phi_hat)
+    snes.solve(None, phi_hat.x.petsc_vec)
+    phi_hat.x.scatter_forward()
     t_solve = time.perf_counter() - t0
+
+    n_iters = snes.getIterationNumber()
+    fnorm = snes.getFunctionNorm()
+    reason = snes.getConvergedReason()
+    converged = reason > 0
+
+    _SNES_REASONS = {
+        2: "RTOL", 3: "ATOL", 4: "STOL", 5: "ITS",
+        -1: "FNORM_NAN", -2: "FUNCTION_COUNT", -3: "LINEAR_SOLVE",
+        -4: "FUNCTION_RANGE", -5: "DIVERGED_LINE_SEARCH",
+        -6: "MAX_IT", -7: "DTOL", -8: "DIVERGED_LOCAL_MIN",
+    }
+    reason_str = _SNES_REASONS.get(reason, f"CODE_{reason}")
 
     # --- Exp-argument clamp diagnostics ---
     phi_arr = phi_hat.x.array
@@ -961,7 +990,10 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
 
     info = {
         "converged": converged,
+        "reason": reason,
+        "reason_str": reason_str,
         "newton_iters": n_iters,
+        "fnorm": fnorm,
         "solve_time": t_solve,
         "phi_hat_min": phi_min,
         "phi_hat_max": phi_max,
@@ -974,9 +1006,9 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     if comm.rank == 0:
         tag = "CONVERGED" if converged else "FAILED"
         print(f"\n=== SNES {tag} ===")
-        print(f"  Newton iterations : {n_iters}")
-        print(f"  Converged         : {converged}")
-        print(f"  Criterion         : residual (|F|/|F0| < rtol OR |F| < atol)")
+        print(f"  SNES iterations   : {n_iters}")
+        print(f"  Final ||F||       : {fnorm:.6e}")
+        print(f"  Reason            : {reason_str} ({reason})")
         print(f"  Solve time        : {t_solve:.3f} s")
         print(f"  phi_hat range     : [{phi_min:.4f}, {phi_max:.4f}]")
         print(f"  --- Exp-argument diagnostics ---")
@@ -989,9 +1021,11 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
             print(f"  *** WARNING: >1% DOFs clamped — solution may be physically nonsense ***")
         print(f"====================\n")
 
+    snes.destroy()
+
     if not converged:
         raise PoissonSolveError(
-            f"SNES diverged: {n_iters} iters, converged={converged}"
+            f"SNES diverged: {n_iters} iters, reason={reason_str}, ||F||={fnorm:.3e}"
         )
 
     return info
