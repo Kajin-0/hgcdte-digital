@@ -834,22 +834,26 @@ def build_nonlinear_poisson(msh, scaling, dims, V_bias, Nd, Na, n_i,
 
 
 def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
+                            phi_ref_hat_value=0.0,
                             max_newton=50, snes_rtol=1e-8, snes_atol=1e-10,
                             verbose=True):
     """
     Solve F(phi_hat) = 0 using DOLFINx 0.10 NewtonSolver (PETSc SNES).
 
-    Returns dict with convergence info.
+    Uses residual-based convergence criterion (not incremental).
+    Reports exp-argument clamp diagnostics after solve.
+
+    Returns dict with convergence info + clamp diagnostics.
     """
     # DOLFINx 0.10 API: NonlinearProblem stores forms, NewtonSolver drives SNES
     problem = fem_petsc.NonlinearProblem(F_form, phi_hat, bcs=bcs, J=J_form)
     solver = dolfinx.nls.petsc.NewtonSolver(comm, problem)
 
-    # Newton parameters
+    # Newton parameters — use RESIDUAL criterion so we converge on |F|, not |du|
     solver.atol = snes_atol
     solver.rtol = snes_rtol
     solver.max_it = max_newton
-    solver.convergence_criterion = "incremental"
+    solver.convergence_criterion = "residual"
 
     # KSP for linear sub-problems (accessed via the underlying SNES)
     ksp = solver.krylov_solver
@@ -869,12 +873,29 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     n_iters, converged = solver.solve(phi_hat)
     t_solve = time.perf_counter() - t0
 
-    # Check exp argument bounds
+    # --- Exp-argument clamp diagnostics ---
     phi_arr = phi_hat.x.array
     phi_min_local = phi_arr.min()
     phi_max_local = phi_arr.max()
     phi_min = comm.allreduce(phi_min_local, op=MPI.MIN)
     phi_max = comm.allreduce(phi_max_local, op=MPI.MAX)
+
+    # Compute exp argument = phi_hat - phi_ref across all DOFs
+    arg_arr = phi_arr - phi_ref_hat_value
+    arg_min_local = arg_arr.min()
+    arg_max_local = arg_arr.max()
+    arg_min = comm.allreduce(arg_min_local, op=MPI.MIN)
+    arg_max = comm.allreduce(arg_max_local, op=MPI.MAX)
+
+    # Fraction of DOFs that would be clamped
+    n_local = len(arg_arr)
+    n_clamp_hi_local = int(np.sum(arg_arr > EXP_CLIP))
+    n_clamp_lo_local = int(np.sum(arg_arr < -EXP_CLIP))
+    n_total = comm.allreduce(n_local, op=MPI.SUM)
+    n_clamp_hi = comm.allreduce(n_clamp_hi_local, op=MPI.SUM)
+    n_clamp_lo = comm.allreduce(n_clamp_lo_local, op=MPI.SUM)
+    pct_clamp_hi = 100.0 * n_clamp_hi / max(n_total, 1)
+    pct_clamp_lo = 100.0 * n_clamp_lo / max(n_total, 1)
 
     info = {
         "converged": converged,
@@ -882,6 +903,10 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
         "solve_time": t_solve,
         "phi_hat_min": phi_min,
         "phi_hat_max": phi_max,
+        "exp_arg_min": arg_min,
+        "exp_arg_max": arg_max,
+        "pct_clamp_hi": pct_clamp_hi,
+        "pct_clamp_lo": pct_clamp_lo,
     }
 
     if comm.rank == 0:
@@ -889,8 +914,17 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
         print(f"\n=== SNES {tag} ===")
         print(f"  Newton iterations : {n_iters}")
         print(f"  Converged         : {converged}")
+        print(f"  Criterion         : residual (|F|/|F0| < rtol OR |F| < atol)")
         print(f"  Solve time        : {t_solve:.3f} s")
         print(f"  phi_hat range     : [{phi_min:.4f}, {phi_max:.4f}]")
+        print(f"  --- Exp-argument diagnostics ---")
+        print(f"  phi_ref_hat       : {phi_ref_hat_value:.4f}")
+        print(f"  arg = phi-phi_ref : [{arg_min:.4f}, {arg_max:.4f}]")
+        print(f"  EXP_CLIP          : +/-{EXP_CLIP}")
+        print(f"  DOFs clamped high : {n_clamp_hi}/{n_total} ({pct_clamp_hi:.4f}%)")
+        print(f"  DOFs clamped low  : {n_clamp_lo}/{n_total} ({pct_clamp_lo:.4f}%)")
+        if pct_clamp_hi > 1.0 or pct_clamp_lo > 1.0:
+            print(f"  *** WARNING: >1% DOFs clamped — solution may be physically nonsense ***")
         print(f"====================\n")
 
     if not converged:
@@ -938,7 +972,8 @@ def run_nonlinear_poisson(args, comm, rank):
         print(f"  DOFs = {V.dofmap.index_map.size_global}")
 
     info = solve_nonlinear_poisson(
-        F_form, J_form, phi_hat, bcs, comm, verbose=True
+        F_form, J_form, phi_hat, bcs, comm,
+        phi_ref_hat_value=phi_ref_val, verbose=True
     )
 
     # Physical output
@@ -981,8 +1016,9 @@ def run_nonlinear_bias_sweep(args, comm, rank):
         print(f"  Nd={args.Nd:.3e}  Na={args.Na:.3e}  n_i={args.n_i:.3e}")
         print("="*70)
         print(f"{'V_bias':>8s}  {'Newton':>7s}  {'time':>7s}  "
-              f"{'phi_min':>12s}  {'phi_max':>12s}  {'status':>10s}")
-        print("-" * 70)
+              f"{'phi_min':>10s}  {'phi_max':>10s}  "
+              f"{'arg_min':>8s}  {'arg_max':>8s}  {'clamp%':>7s}  {'status':>6s}")
+        print("-" * 85)
 
     all_ok = True
     for V_bias in V_array:
@@ -991,19 +1027,24 @@ def run_nonlinear_bias_sweep(args, comm, rank):
                 msh, scaling, dims, V_bias, args.Nd, args.Na, args.n_i
             )
             info = solve_nonlinear_poisson(
-                F_form, J_form, phi_hat, bcs, comm, verbose=False
+                F_form, J_form, phi_hat, bcs, comm,
+                phi_ref_hat_value=phi_ref_val, verbose=False
             )
+            total_clamp = info['pct_clamp_hi'] + info['pct_clamp_lo']
             if rank == 0:
                 print(f"{V_bias:>8.3f}  {info['newton_iters']:>7d}  "
                       f"{info['solve_time']:>7.2f}  "
-                      f"{info['phi_hat_min']:>12.4f}  {info['phi_hat_max']:>12.4f}  "
-                      f"{'OK' if info['converged'] else 'FAIL':>10s}")
+                      f"{info['phi_hat_min']:>10.4f}  {info['phi_hat_max']:>10.4f}  "
+                      f"{info['exp_arg_min']:>8.2f}  {info['exp_arg_max']:>8.2f}  "
+                      f"{total_clamp:>6.2f}%  "
+                      f"{'OK' if info['converged'] else 'FAIL':>6s}")
             if not info["converged"]:
                 all_ok = False
         except PoissonSolveError as e:
             if rank == 0:
                 print(f"{V_bias:>8.3f}  {'---':>7s}  {'---':>7s}  "
-                      f"{'---':>12s}  {'---':>12s}  {'DIVERGED':>10s}")
+                      f"{'---':>10s}  {'---':>10s}  "
+                      f"{'---':>8s}  {'---':>8s}  {'---':>7s}  {'DIV':>6s}")
             all_ok = False
 
     if rank == 0:
