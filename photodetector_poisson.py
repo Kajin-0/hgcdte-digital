@@ -63,6 +63,11 @@ from pathlib import Path
 
 import numpy as np
 from mpi4py import MPI
+
+# CRITICAL: Initialize petsc4py with sys.argv so PETSc picks up CLI flags
+# like -snes_monitor, -ksp_monitor, etc. Must happen BEFORE importing PETSc.
+import petsc4py
+petsc4py.init(sys.argv)
 from petsc4py import PETSc
 
 import dolfinx
@@ -909,7 +914,8 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     J_compiled = fem.form(J_form)
 
     # --- Allocate residual vector and Jacobian matrix ---
-    b_vec = fem_petsc.create_vector(F_compiled)
+    # DOLFINx 0.10: create_vector takes FunctionSpace, not Form
+    b_vec = fem_petsc.create_vector(phi_hat.function_space)
     A_mat = fem_petsc.create_matrix(J_compiled)
 
     # --- SNES residual callback ---
@@ -947,6 +953,7 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     snes.setFunction(snes_F, b_vec)
     snes.setJacobian(snes_J, A_mat, A_mat)
 
+    # Set programmatic defaults (CLI flags override via setFromOptions below)
     snes.setType("newtonls")
     snes.setTolerances(rtol=snes_rtol, atol=snes_atol, max_it=max_newton)
 
@@ -962,16 +969,26 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     pc.setType("hypre")
     pc.setHYPREType("boomeramg")
 
-    # Allow PETSc command-line overrides
-    snes.setFromOptions()
-
-    # Monitor (optional)
+    # Built-in monitor (always on when verbose; PETSc monitors add on top)
     if verbose and comm.rank == 0:
         snes.setMonitor(
             lambda s, it, fnorm: print(
-                f"  SNES iter {it:3d} | ||F|| = {fnorm:.6e}"
+                f"  SNES iter {it:3d} | ||F|| = {fnorm:.6e}", flush=True
             )
         )
+
+    # CRITICAL: setFromOptions AFTER all programmatic config but BEFORE solve.
+    # This lets CLI flags like -snes_monitor, -ksp_monitor override/augment.
+    snes.setFromOptions()
+    ksp.setFromOptions()
+
+    # Debug: confirm SNES actually has sane tolerances
+    if comm.rank == 0:
+        rtol_s, atol_s, stol_s, max_it_s = snes.getTolerances()
+        print(f"  [SNES config] type={snes.getType()} max_it={max_it_s} "
+              f"rtol={rtol_s:.1e} atol={atol_s:.1e}", flush=True)
+        print(f"  [KSP  config] type={ksp.getType()} "
+              f"pc={pc.getType()}", flush=True)
 
     # --- Solve ---
     t0 = time.perf_counter()
