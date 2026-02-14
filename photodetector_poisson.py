@@ -450,9 +450,12 @@ class SolveResult:
     reason_str: str
 
 
-def solve_poisson(A, b, phi, cfg=SolverConfig(), comm=MPI.COMM_WORLD) -> SolveResult:
+def solve_poisson(A, b, phi, cfg=SolverConfig(), comm=MPI.COMM_WORLD,
+                  prefix=None) -> SolveResult:
     """CG + AMG solve with convergence check.  Raises on divergence."""
     ksp = PETSc.KSP().create(comm)
+    if prefix:
+        ksp.setOptionsPrefix(prefix)
     ksp.setOperators(A)
     ksp.setType(cfg.ksp_type)
     ksp.setTolerances(rtol=cfg.rtol, atol=cfg.atol, max_it=cfg.max_iter)
@@ -934,7 +937,8 @@ def build_nonlinear_poisson(msh, scaling, dims, V_bias, Nd, Na, n_i,
     V_lin, A_lin, b_lin, bcs_lin, phi_lin = build_poisson_system(
         msh, scaling, dims, V_bias, rho_hat_expr=rho_dop_expr
     )
-    solve_poisson(A_lin, b_lin, phi_lin, SolverConfig(), msh.comm)
+    solve_poisson(A_lin, b_lin, phi_lin, SolverConfig(), msh.comm,
+                  prefix="init_")
 
     # Copy linear solution into phi_hat as initial guess
     phi_hat.x.array[:] = phi_lin.x.array[:]
@@ -1074,7 +1078,7 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     _prev_x = [phi_hat.x.petsc_vec.copy()]  # mutable container for closure
 
     def _snes_monitor(snes_obj, it, fnorm):
-        if it > 0 and comm.rank == 0:
+        if it > 0:
             # Compute Newton step magnitude: du = x_new - x_old
             x_new = snes_obj.getSolution()
             du = x_new.copy()
@@ -1084,9 +1088,10 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
             du_inf_local = np.max(np.abs(du_local)) if n_own > 0 else 0.0
             du_inf = comm.allreduce(du_inf_local, op=MPI.MAX)
             du_l2 = du.norm()
-            print(f"  SNES iter {it:3d} | ||F|| = {fnorm:.6e} | "
-                  f"||du||_inf = {du_inf:.4f} | ||du||_2 = {du_l2:.4e}",
-                  flush=True)
+            if comm.rank == 0:
+                print(f"  SNES iter {it:3d} | ||F|| = {fnorm:.6e} | "
+                      f"||du||_inf = {du_inf:.4f} | ||du||_2 = {du_l2:.4e}",
+                      flush=True)
             du.destroy()
         elif comm.rank == 0:
             print(f"  SNES iter {it:3d} | ||F|| = {fnorm:.6e}", flush=True)
@@ -1110,6 +1115,8 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
               f"pc={pc.getType()}", flush=True)
 
     # --- Solve ---
+    if comm.rank == 0:
+        print(f"  Starting SNES solve...", flush=True)
     t0 = time.perf_counter()
     snes.solve(None, phi_hat.x.petsc_vec)
     phi_hat.x.scatter_forward()
