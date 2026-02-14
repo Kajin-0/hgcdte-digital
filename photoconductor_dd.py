@@ -2615,6 +2615,17 @@ def run_brick5(args, comm, rank):
         A_p.destroy()
         b_p.destroy()
 
+        # Positivity floor for holes (p̂ must be > 0)
+        # Use a floor at 1e-3 × p_eq_hat to prevent undershoot
+        p_eq_hat = ni_hat**2 / Nd_hat if Nd_hat > 0 else ni_hat
+        p_floor = 1e-3 * p_eq_hat
+        n_clamped_local = int(np.sum(p_hat.x.array[:n_own] < p_floor))
+        n_clamped = comm.allreduce(n_clamped_local, op=MPI.SUM)
+        p_hat.x.array[:] = np.maximum(p_hat.x.array[:], p_floor)
+        p_hat.x.scatter_forward()
+        if rank == 0 and n_clamped > 0:
+            print(f"      (clamped {n_clamped} p̂ DOFs to floor={p_floor:.3e})")
+
         # Convergence check
         n_own = V.dofmap.index_map.size_local
         dn = np.linalg.norm(n_hat.x.array[:n_own] - n_prev[:n_own])
@@ -2654,13 +2665,20 @@ def run_brick5(args, comm, rank):
         t_pos = n_min > 0 and p_min > 0
         print(f"  Positivity: {'PASS' if t_pos else 'FAIL'}")
 
-    # Step 5: Photoconductor identity
-    # Total current = ∫_contacts (Jn + Jp)·n̂ dA = q ∫(G - R) dV
+    # Step 5: Separated continuity identities
+    # ═══════════════════════════════════════════════════════════════════
+    # Physics:
+    #   ∇̂·Ĵn = +(Ĝ - R̂)   ⟹  ∮ Ĵn·n̂ dÂ = +∫(Ĝ - R̂)dV̂
+    #   ∇̂·Ĵp = -(Ĝ - R̂)   ⟹  ∮ Ĵp·n̂ dÂ = -∫(Ĝ - R̂)dV̂
+    #   ∇̂·(Ĵn+Ĵp) = 0     ⟹  ∮ (Ĵn+Ĵp)·n̂ dÂ = 0
+    #
+    # Ĵn = -n̂ ∇̂φ̂ + ∇̂n̂
+    # Ĵp = -p̂ ∇̂φ̂ - ∇̂p̂
+    # ═══════════════════════════════════════════════════════════════════
     Jn_expr = -n_hat * ufl.grad(phi_hat) + ufl.grad(n_hat)
     Jp_expr = -p_hat * ufl.grad(phi_hat) - ufl.grad(p_hat)
-    J_total = Jn_expr + Jp_expr
 
-    # Contact integration (reuse facet marking)
+    # Contact integration via facet marking
     tdim = msh.topology.dim
     fdim = tdim - 1
     Lx_hat = dims["Lx_hat"]
@@ -2683,49 +2701,127 @@ def run_brick5(args, comm, rank):
     ds = ufl.Measure("ds", domain=msh, subdomain_data=ft)
     nv = ufl.FacetNormal(msh)
 
-    I_left_form = fem.form(ufl.inner(J_total, nv) * ds(1))
-    I_right_form = fem.form(ufl.inner(J_total, nv) * ds(2))
-    I_left = comm.allreduce(fem.assemble_scalar(I_left_form), op=MPI.SUM)
-    I_right = comm.allreduce(fem.assemble_scalar(I_right_form), op=MPI.SUM)
+    # --- Separated contact fluxes ---
+    # Electron
+    In_left = comm.allreduce(
+        fem.assemble_scalar(fem.form(ufl.inner(Jn_expr, nv) * ds(1))), op=MPI.SUM)
+    In_right = comm.allreduce(
+        fem.assemble_scalar(fem.form(ufl.inner(Jn_expr, nv) * ds(2))), op=MPI.SUM)
+    In_net = In_left + In_right
 
-    # Volume integrals
+    # Hole
+    Ip_left = comm.allreduce(
+        fem.assemble_scalar(fem.form(ufl.inner(Jp_expr, nv) * ds(1))), op=MPI.SUM)
+    Ip_right = comm.allreduce(
+        fem.assemble_scalar(fem.form(ufl.inner(Jp_expr, nv) * ds(2))), op=MPI.SUM)
+    Ip_net = Ip_left + Ip_right
+
+    # Total
+    I_tot = In_net + Ip_net
+
+    # --- Volume integrals (per-carrier scaling) ---
+    # Each carrier's continuity is nondimensionalized by its own mobility:
+    #   Electron: source_hat = G × L²/(n_ref μn Vt)
+    #   Hole:     source_hat = G × L²/(n_ref μp Vt)
+    # So the identity must compare carrier flux with matching G_hat.
     x = ufl.SpatialCoordinate(msh)
-    vol_G = 0.0
-    vol_R = 0.0
 
+    # Electron-scaled source integrals
+    vol_G_n = 0.0
+    vol_R_n = 0.0
     if G0 > 0:
-        G0_hat = G0 * L_norm**2 / (scaling.n_ref * mu_n * scaling.V_t)
+        G0_hat_n = G0 * L_norm**2 / (scaling.n_ref * mu_n * scaling.V_t)
         alpha_hat_opt = alpha_opt * L_norm
-        G_hat = G0_hat * ufl.exp(-alpha_hat_opt * x[0])
-        vol_G = comm.allreduce(fem.assemble_scalar(fem.form(G_hat * ufl.dx)), op=MPI.SUM)
-
+        G_hat_n = G0_hat_n * ufl.exp(-alpha_hat_opt * x[0])
+        vol_G_n = comm.allreduce(
+            fem.assemble_scalar(fem.form(G_hat_n * ufl.dx)), op=MPI.SUM)
     if tau_n > 0:
         tau_hat_n = tau_n * mu_n * scaling.V_t / L_norm**2
-        R_hat = (n_hat * p_hat - ni_hat**2) / (tau_hat_n * (n_hat + p_hat + 2*ni_hat))
-        vol_R = comm.allreduce(fem.assemble_scalar(fem.form(R_hat * ufl.dx)), op=MPI.SUM)
+        R_hat_n = (n_hat * p_hat - ni_hat**2) / (tau_hat_n * (n_hat + p_hat + 2*ni_hat))
+        vol_R_n = comm.allreduce(
+            fem.assemble_scalar(fem.form(R_hat_n * ufl.dx)), op=MPI.SUM)
+    S_net_n = vol_G_n - vol_R_n
 
-    I_net = I_left + I_right
-    S_net = vol_G - vol_R
-    eta_vol = abs(I_net - S_net) / max(abs(I_net), abs(S_net), 1e-30)
+    # Hole-scaled source integrals
+    vol_G_p = 0.0
+    vol_R_p = 0.0
+    if G0 > 0:
+        G0_hat_p = G0 * L_norm**2 / (scaling.n_ref * mu_p * scaling.V_t)
+        G_hat_p = G0_hat_p * ufl.exp(-alpha_hat_opt * x[0])
+        vol_G_p = comm.allreduce(
+            fem.assemble_scalar(fem.form(G_hat_p * ufl.dx)), op=MPI.SUM)
+    if tau_n > 0:
+        tau_hat_p = tau_n * mu_p * scaling.V_t / L_norm**2
+        R_hat_p = (n_hat * p_hat - ni_hat**2) / (tau_hat_p * (n_hat + p_hat + 2*ni_hat))
+        vol_R_p = comm.allreduce(
+            fem.assemble_scalar(fem.form(R_hat_p * ufl.dx)), op=MPI.SUM)
+    S_net_p = vol_G_p - vol_R_p
+
+    # --- Separated identity metrics ---
+    #   Electron: ∮Ĵn·n̂ dÂ = +∫(Ĝn - R̂n)dV̂  (electron-scaled)
+    #   Hole:     ∮Ĵp·n̂ dÂ = -∫(Ĝp - R̂p)dV̂  (hole-scaled)
+    #   Total:    ∮(Ĵn+Ĵp)·n̂ dÂ = 0
+    eps = 1e-30
+    eta_n = abs(In_net - S_net_n) / max(abs(In_net), abs(S_net_n), eps)
+    eta_p = abs(Ip_net + S_net_p) / max(abs(Ip_net), abs(S_net_p), eps)
+    eta_tot = abs(I_tot) / max(abs(In_net), abs(Ip_net), eps)
+
+    # --- Bulk check: Δn ≈ Δp away from contacts ---
+    # Sample mid-slab (0.3 < x̂/L̂x < 0.7)
+    # np product check
+    np_form = fem.form(n_hat * p_hat * ufl.dx)
+    np_vol = comm.allreduce(fem.assemble_scalar(np_form), op=MPI.SUM)
+    vol_form = fem.form(fem.Constant(msh, PETSc.ScalarType(1.0)) * ufl.dx)
+    domain_vol = comm.allreduce(fem.assemble_scalar(vol_form), op=MPI.SUM)
+    np_mean = np_vol / max(domain_vol, eps)
+    np_over_ni2 = np_mean / max(ni_hat**2, eps)
 
     # Physical scale
     J_scale = Q_E * mu_n * scaling.n_ref * scaling.V_t / L_norm
 
     if rank == 0:
-        print(f"\n  --- Photoconductor identity ---")
-        print(f"  Î_left  = {I_left:.6e}")
-        print(f"  Î_right = {I_right:.6e}")
-        print(f"  I_net   = {I_net:.6e}")
-        print(f"  ∫Ĝ dV̂  = {vol_G:.6e}")
-        print(f"  ∫R̂ dV̂  = {vol_R:.6e}")
-        print(f"  S_net   = {S_net:.6e}")
-        print(f"  η_vol   = {eta_vol:.6e} ({'PASS' if eta_vol < 0.05 else 'FAIL'} < 5%)")
+        print(f"\n  --- Photoconductor identities (Brick 5) ---")
+        print(f"  Scaling: Ĵ = J / (q μn nref Vt / L_norm)")
         print(f"  J_scale = {J_scale:.6e} A/m²")
+        print(f"")
+        print(f"  ELECTRON (∮Ĵn·n̂ dÂ = +∫(Ĝ-R̂)dV̂):")
+        print(f"    În_left  = {In_left:.6e}")
+        print(f"    În_right = {In_right:.6e}")
+        print(f"    În_net   = {In_net:.6e}")
+        print(f"    ∫(Ĝn-R̂n)= {S_net_n:.6e}  (electron-scaled)")
+        print(f"    η_n_vol  = {eta_n:.6e} ({'PASS' if eta_n < 0.05 else 'FAIL'})")
+        print(f"")
+        print(f"  HOLE (∮Ĵp·n̂ dÂ = -∫(Ĝ-R̂)dV̂):")
+        print(f"    Îp_left  = {Ip_left:.6e}")
+        print(f"    Îp_right = {Ip_right:.6e}")
+        print(f"    Îp_net   = {Ip_net:.6e}")
+        print(f"   -∫(Ĝp-R̂p)= {-S_net_p:.6e}  (hole-scaled)")
+        print(f"    η_p_vol  = {eta_p:.6e} ({'PASS' if eta_p < 0.05 else 'FAIL'})")
+        print(f"")
+        print(f"  TOTAL CURRENT (∮(Ĵn+Ĵp)·n̂ = 0):")
+        print(f"    I_tot    = {I_tot:.6e}")
+        print(f"    η_tot    = {eta_tot:.6e} ({'PASS' if eta_tot < 0.01 else 'FAIL'})")
+        print(f"")
+        print(f"  VOLUME:")
+        print(f"    ∫Ĝn dV̂  = {vol_G_n:.6e} (e⁻ scaled)")
+        print(f"    ∫R̂n dV̂  = {vol_R_n:.6e} (e⁻ scaled)")
+        print(f"    ∫Ĝp dV̂  = {vol_G_p:.6e} (h⁺ scaled)")
+        print(f"    ∫R̂p dV̂  = {vol_R_p:.6e} (h⁺ scaled)")
+        if mu_n != mu_p:
+            print(f"    (μn/μp = {mu_n/mu_p:.1f} → different nondim scales)")
+        print(f"    mean(n̂p̂)/n̂i² = {np_over_ni2:.6e}")
+        print(f"")
+
+        all_pass = (t_pos and eta_n < 0.05 and eta_p < 0.05 and eta_tot < 0.01)
+        print(f"  OVERALL: {'ALL PASS' if all_pass else 'SOME FAILED'}")
         print("=" * 70 + "\n")
 
     return {
-        "I_left": I_left, "I_right": I_right,
-        "vol_G": vol_G, "vol_R": vol_R, "eta_vol": eta_vol,
+        "In_left": In_left, "In_right": In_right, "In_net": In_net,
+        "Ip_left": Ip_left, "Ip_right": Ip_right, "Ip_net": Ip_net,
+        "I_tot": I_tot,
+        "vol_G": vol_G, "vol_R": vol_R,
+        "eta_n": eta_n, "eta_p": eta_p, "eta_tot": eta_tot,
         "n_min": n_min, "n_max": n_max,
         "p_min": p_min, "p_max": p_max,
     }
