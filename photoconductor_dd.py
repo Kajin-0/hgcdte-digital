@@ -1071,6 +1071,16 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
         print(f"  SNES iterations   : {n_iters}")
         print(f"  Final ||F||       : {fnorm:.6e}")
         print(f"  Reason            : {reason_str} ({reason})")
+        # KSP diagnostics if SNES failed due to linear solve
+        if reason == -3:  # LINEAR_SOLVE
+            ksp = snes.getKSP()
+            ksp_reason = ksp.getConvergedReason()
+            ksp_its = ksp.getIterationNumber()
+            ksp_rnorm = ksp.getResidualNorm()
+            print(f"  --- KSP failure details ---")
+            print(f"  KSP iterations  : {ksp_its}")
+            print(f"  KSP residual    : {ksp_rnorm:.6e}")
+            print(f"  KSP reason      : {ksp_reason}")
         print(f"  Solve time        : {t_solve:.3f} s")
         print(f"  phi_hat range     : [{phi_min:.4f}, {phi_max:.4f}]")
         print(f"  --- Exp-argument diagnostics ---")
@@ -1522,62 +1532,74 @@ def run_brick4a(args, comm, rank):
     """
     Brick 4a: Solve continuity with fixed φ̂ from Brick 3, dark case.
 
-    1. Run Brick 3 to get converged φ̂(x)
-    2. Build linear continuity system with φ̂ fixed
-    3. Solve for n̂(x)
-    4. Run acceptance tests
+    1. Build mesh and Poisson system
+    2. Solve Brick 3 for φ̂(x)
+    3. Build linear continuity system with φ̂ fixed
+    4. Solve for n̂(x)
+    5. Run acceptance tests
     """
-    # Step 1: Get φ̂ from Brick 3
     if rank == 0:
         print("\n" + "=" * 70)
         print("BRICK 4a: Electron continuity (φ̂ fixed, dark, G=R=0)")
         print("=" * 70)
-        print("  Step 1: Solving Brick 3 (Poisson) for φ̂...")
 
-    info_poisson = run_nonlinear_poisson(args, comm, rank)
-    if info_poisson is None:
-        if rank == 0:
-            print("  Brick 3 failed — cannot proceed to Brick 4a")
-        return None
-
-    # Recover the Poisson solution objects
     scaling = make_mct_scaling_77K()
     geom = DeviceGeometry()
     mcfg = MeshConfig(nx=args.nx, ny=args.ny, nz=args.nz)
     msh, dims = create_device_mesh(geom, scaling.L_ref, mcfg, comm)
 
-    # Rebuild Poisson to get phi_hat Function
+    L_norm = dims["L_norm"]
+    L_ref = dims["L_ref"]
+    alpha_eff = scaling.alpha * (L_ref / L_norm)**2
+    ni_ratio = args.n_i / scaling.n_ref
+
+    if rank == 0:
+        print(f"  n_i = {args.n_i:.3e} m⁻³ (n_i/n_ref = {ni_ratio:.6e})")
+        print(f"  Nd  = {args.Nd:.3e} m⁻³ (Nd/n_ref = {args.Nd/scaling.n_ref:.6e})")
+        print(f"  V_bias = {args.V_bias} V")
+        print(f"  mu_n = {args.mu_n} m²/Vs")
+
+    # Step 1: Solve Brick 3 (Poisson) for φ̂
+    if rank == 0:
+        print(f"\n  Step 1: Solving Brick 3 (Poisson) for φ̂...")
+
     V, F_form, J_form, bcs, phi_hat, phi_ref_val = build_nonlinear_poisson(
         msh, scaling, dims, args.V_bias, args.Nd, args.Na, args.n_i
     )
 
-    # Re-solve (quick: warm start from linear guess, converges in 2 iters)
-    solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
-                            phi_ref_hat_value=phi_ref_val, verbose=False)
+    try:
+        info = solve_nonlinear_poisson(
+            F_form, J_form, phi_hat, bcs, comm,
+            phi_ref_hat_value=phi_ref_val, verbose=True
+        )
+    except PoissonSolveError as e:
+        if rank == 0:
+            print(f"  Brick 3 FAILED: {e}")
+            print(f"  TIP: Try --n_i 1e17 for easier convergence")
+        return None
 
+    # Report φ̂ range (all ranks participate)
+    n_own = V.dofmap.index_map.size_local
+    phi_min = comm.allreduce(
+        phi_hat.x.array[:n_own].min() if n_own > 0 else 1e30, op=MPI.MIN)
+    phi_max = comm.allreduce(
+        phi_hat.x.array[:n_own].max() if n_own > 0 else -1e30, op=MPI.MAX)
     if rank == 0:
-        n_own = V.dofmap.index_map.size_local
-        phi_min = comm.allreduce(phi_hat.x.array[:n_own].min(), op=MPI.MIN)
-        phi_max = comm.allreduce(phi_hat.x.array[:n_own].max(), op=MPI.MAX)
-        print(f"\n  Step 2: φ̂ converged, range [{phi_min:.4f}, {phi_max:.4f}]")
-        print(f"  Step 3: Solving continuity for n̂...")
-    else:
-        # All ranks must participate in allreduce
-        n_own = V.dofmap.index_map.size_local
-        comm.allreduce(phi_hat.x.array[:n_own].min(), op=MPI.MIN)
-        comm.allreduce(phi_hat.x.array[:n_own].max(), op=MPI.MAX)
+        print(f"  φ̂ converged, range [{phi_min:.4f}, {phi_max:.4f}]")
 
     # Step 2: Build and solve continuity
-    mu_n = getattr(args, 'mu_n', 1.0)  # default MCT mobility
+    if rank == 0:
+        print(f"\n  Step 2: Solving continuity for n̂...")
+
+    mu_n = args.mu_n
     V_n, A, b, bcs_n, n_hat = build_continuity_linear(
         msh, scaling, dims, phi_hat, args.Nd, mu_n
     )
-
     solve_continuity(A, b, n_hat, comm)
 
     # Step 3: Acceptance tests
     if rank == 0:
-        print(f"  Step 4: Running acceptance tests...")
+        print(f"  Step 3: Running acceptance tests...")
 
     results = run_brick4a_tests(
         phi_hat, n_hat, scaling, dims, args.Nd, mu_n, args.V_bias, comm
