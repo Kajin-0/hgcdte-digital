@@ -998,26 +998,12 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     def snes_F(snes_obj, X, F_out):
         """Assemble residual F(X) into F_out (the vector SNES provided)."""
         _F_call_count[0] += 1
-
-        # Diagnostic: print X norm BEFORE copy (first 5 calls)
-        if _F_call_count[0] <= 5 and comm.rank == 0:
-            print(f"    [F#{_F_call_count[0]}] ENTER ||X||={X.norm():.6e} "
-                  f"X.local_size={X.getLocalSize()} X.size={X.getSize()}",
-                  flush=True)
-
         _update_phi_from_x(X)
 
-        # Diagnostic: verify copy worked (compare owned DOFs)
-        if _F_call_count[0] <= 5:
-            n_own = phi_hat.function_space.dofmap.index_map.size_local
-            with X.localForm() as xloc:
-                x_local = xloc.array[:n_own].copy()
-            phi_local = phi_hat.x.array[:n_own].copy()
-            local_diff = np.max(np.abs(phi_local - x_local)) if n_own > 0 else 0.0
-            global_diff = comm.allreduce(local_diff, op=MPI.MAX)
-            if comm.rank == 0:
-                print(f"    [F#{_F_call_count[0]}] COPY max|phi-X|={global_diff:.6e}",
-                      flush=True)
+        # Diagnostic: rank-0 only prints (NO MPI collectives inside callback)
+        if _F_call_count[0] <= 5 and comm.rank == 0:
+            print(f"    [F#{_F_call_count[0]}] ||X||={X.norm():.6e}",
+                  flush=True)
 
         # Zero the SNES-provided F and assemble into it
         F_out.set(0.0)
@@ -1030,9 +1016,9 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
                           mode=PETSc.ScatterMode.REVERSE)
         fem_petsc.set_bc(F_out, bcs, X)
 
-        # Diagnostic: print assembled ||F|| (must match SNES gnorm)
+        # Diagnostic: print assembled ||F||
         if _F_call_count[0] <= 5 and comm.rank == 0:
-            print(f"    [F#{_F_call_count[0]}] EXIT ||F||={F_out.norm():.6e}",
+            print(f"    [F#{_F_call_count[0]}] ||F||={F_out.norm():.6e}",
                   flush=True)
 
     # --- SNES Jacobian callback ---
@@ -1046,6 +1032,7 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
 
     # --- Create and configure SNES ---
     snes = PETSc.SNES().create(comm)
+    snes.setOptionsPrefix("nl_")  # Use -nl_snes_*, -nl_ksp_*, -nl_pc_* CLI flags
     snes.setFunction(snes_F, b_vec)
     snes.setJacobian(snes_J, A_mat, A_mat)
 
@@ -1064,7 +1051,7 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
                        stol=1e-8, max_it=max_newton)
     # Set dtol separately (PETSc default 1e4 may trigger DIVERGED_DTOL too early)
     opts = PETSc.Options()
-    opts["snes_divergence_tolerance"] = 1e10
+    opts["nl_snes_divergence_tolerance"] = 1e10
 
     # KSP: GMRES + AMG (GMRES safer than CG for non-SPD Jacobians)
     ksp = snes.getKSP()
@@ -1079,15 +1066,12 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
 
     def _snes_monitor(snes_obj, it, fnorm):
         if it > 0:
-            # Compute Newton step magnitude: du = x_new - x_old
+            # Compute Newton step magnitude using PETSc norm (MPI-safe)
             x_new = snes_obj.getSolution()
             du = x_new.copy()
             du.axpy(-1.0, _prev_x[0])
-            n_own = phi_hat.function_space.dofmap.index_map.size_local
-            du_local = du.array[:n_own]
-            du_inf_local = np.max(np.abs(du_local)) if n_own > 0 else 0.0
-            du_inf = comm.allreduce(du_inf_local, op=MPI.MAX)
             du_l2 = du.norm()
+            du_inf = du.norm(PETSc.NormType.NORM_INFINITY)
             if comm.rank == 0:
                 print(f"  SNES iter {it:3d} | ||F|| = {fnorm:.6e} | "
                       f"||du||_inf = {du_inf:.4f} | ||du||_2 = {du_l2:.4e}",
