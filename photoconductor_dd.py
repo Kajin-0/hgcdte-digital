@@ -2617,11 +2617,12 @@ def run_brick5(args, comm, rank):
 
         # Positivity floor for holes (p̂ must be > 0)
         # Use a floor at 1e-3 × p_eq_hat to prevent undershoot
+        n_own = V.dofmap.index_map.size_local
         p_eq_hat = ni_hat**2 / Nd_hat if Nd_hat > 0 else ni_hat
         p_floor = 1e-3 * p_eq_hat
         n_clamped_local = int(np.sum(p_hat.x.array[:n_own] < p_floor))
         n_clamped = comm.allreduce(n_clamped_local, op=MPI.SUM)
-        p_hat.x.array[:] = np.maximum(p_hat.x.array[:], p_floor)
+        p_hat.x.array[:n_own] = np.maximum(p_hat.x.array[:n_own], p_floor)
         p_hat.x.scatter_forward()
         if rank == 0 and n_clamped > 0:
             print(f"      (clamped {n_clamped} p̂ DOFs to floor={p_floor:.3e})")
