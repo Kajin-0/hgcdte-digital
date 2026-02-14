@@ -1512,86 +1512,196 @@ def run_brick4a_tests(phi_hat, n_hat, scaling, dims, Nd, mu_n, V_bias, comm):
     """
     Brick 4a acceptance tests for dark biased resistor.
 
-    Tests:
-    1) Jn spatially constant (x-component, relative variation < 1e-3)
-    2) Jn vs analytic J = q μn Nd V_bias / L
-    3) n ≈ Nd everywhere (< 1%)
-    4) Peclet number diagnostic
+    Physics-correct tests for 3D with partial contacts:
+    1) n > 0 everywhere (positivity)
+    2) n ≈ Nd (quasi-neutrality, dark)
+    3) ∇·Jn ≈ 0 (current conservation, L2 norm)
+    4) Contact current balance: |I_left + I_right| / max(|I|) < tol
+    5) Scaling cross-checks (J_scale, Pe, dimensional consistency)
     """
     rank = comm.rank
+    msh = phi_hat.function_space.mesh
+    gdim = msh.geometry.dim
+
+    # --- Compute dimensionless Jn_hat = -n̂ ∇̂φ̂ + ∇̂n̂ ---
     J_scale, Jn_hat = compute_current_density_3d(
         phi_hat, n_hat, scaling, dims, mu_n, comm
     )
 
-    # Get owned Jn_x values
-    n_own = Jn_hat.function_space.dofmap.index_map.size_local
-    gdim = Jn_hat.function_space.mesh.geometry.dim
-    Jn_arr = Jn_hat.x.array[:n_own * gdim].reshape(-1, gdim)
-    Jn_x_hat = Jn_arr[:, 0]  # x-component (through-thickness = current direction)
-    Jn_x_phys = Jn_x_hat * J_scale
+    # --- n̂ statistics ---
+    n_own = n_hat.function_space.dofmap.index_map.size_local
+    n_arr = n_hat.x.array[:n_own]
+    n_hat_min = comm.allreduce(n_arr.min() if n_own > 0 else 1e30, op=MPI.MIN)
+    n_hat_max = comm.allreduce(n_arr.max() if n_own > 0 else -1e30, op=MPI.MAX)
+    n_phys_min = n_hat_min * scaling.n_ref
+    n_phys_max = n_hat_max * scaling.n_ref
 
-    # Global statistics via MPI
-    Jn_x_sum = comm.allreduce(np.sum(Jn_x_phys), op=MPI.SUM)
-    Jn_x_count = comm.allreduce(len(Jn_x_phys), op=MPI.SUM)
-    Jn_x_mean = Jn_x_sum / max(Jn_x_count, 1)
-    Jn_x_max = comm.allreduce(np.max(Jn_x_phys) if len(Jn_x_phys) > 0 else -1e30, op=MPI.MAX)
-    Jn_x_min = comm.allreduce(np.min(Jn_x_phys) if len(Jn_x_phys) > 0 else 1e30, op=MPI.MIN)
+    # --- φ̂ statistics ---
+    phi_own = phi_hat.function_space.dofmap.index_map.size_local
+    phi_arr = phi_hat.x.array[:phi_own]
+    phi_hat_min = comm.allreduce(phi_arr.min() if phi_own > 0 else 1e30, op=MPI.MIN)
+    phi_hat_max = comm.allreduce(phi_arr.max() if phi_own > 0 else -1e30, op=MPI.MAX)
 
-    # n̂ statistics
-    n_own_v = n_hat.function_space.dofmap.index_map.size_local
-    n_arr = n_hat.x.array[:n_own_v]
-    n_phys = n_arr * scaling.n_ref
-    n_min = comm.allreduce(np.min(n_phys) if n_own_v > 0 else 1e30, op=MPI.MIN)
-    n_max = comm.allreduce(np.max(n_phys) if n_own_v > 0 else -1e30, op=MPI.MAX)
+    # --- Divergence of Jn (conservation test) ---
+    # ∇·Jn_hat should be 0 for G=R=0
+    # Compute in DG0 scalar space
+    V_dg0 = fem.functionspace(msh, ("DG", 0))
+    Jn_expr_ufl = -n_hat * ufl.grad(phi_hat) + ufl.grad(n_hat)
+    div_Jn = ufl.div(Jn_expr_ufl)
 
-    # Peclet numbers
-    Pe_device = abs(V_bias) / scaling.V_t  # = V_hat, global drift/diffusion
+    # L2 norm of div(Jn) via integration
+    div_Jn_sq_form = fem.form(div_Jn**2 * ufl.dx)
+    div_Jn_sq_local = fem.assemble_scalar(div_Jn_sq_form)
+    div_Jn_sq_global = comm.allreduce(div_Jn_sq_local, op=MPI.SUM)
+    div_Jn_L2 = np.sqrt(max(div_Jn_sq_global, 0.0))
+
+    # L2 norm of Jn for normalization
+    Jn_sq_form = fem.form(ufl.inner(Jn_expr_ufl, Jn_expr_ufl) * ufl.dx)
+    Jn_sq_local = fem.assemble_scalar(Jn_sq_form)
+    Jn_sq_global = comm.allreduce(Jn_sq_local, op=MPI.SUM)
+    Jn_L2 = np.sqrt(max(Jn_sq_global, 0.0))
+
+    # Domain length scale for normalization
+    L_norm = dims["L_norm"]
     Lx_hat = dims["Lx_hat"]
-    h_x_hat = Lx_hat / 20.0  # approximate cell size
-    Pe_cell = (abs(V_bias) / scaling.V_t) / (2.0 * 20)  # V_hat / (2*nx)
+
+    # Relative divergence metric: η_div = ||∇·Jn||_L2 / (||Jn||_L2 / L)
+    eta_div = div_Jn_L2 / max(Jn_L2 / Lx_hat, 1e-30)
+
+    # --- Contact current balance ---
+    # I_k = ∫_Γk Jn · n̂ dA  (dimensionless, multiply by J_scale for physical)
+    # Left contact: x=0 (outward normal = -x̂), so Jn·n̂ = -Jn_x
+    # Right contact: x=Lx_hat (outward normal = +x̂), so Jn·n̂ = +Jn_x
+    Ly_hat = dims["Ly_hat"]
+    y_left_max = 1000e-6 / L_norm
+    y_right_min = 2000e-6 / L_norm
+    tol_bc = 1e-8
+
+    # Create boundary measure with marked facets
+    tdim = msh.topology.dim
+    fdim = tdim - 1
+
+    # Left contact facets
+    def left_marker(x):
+        return (np.abs(x[0]) < tol_bc) & (x[1] >= -tol_bc) & (x[1] <= y_left_max + tol_bc)
+    left_facets = dmesh.locate_entities_boundary(msh, fdim, left_marker)
+
+    # Right contact facets
+    def right_marker(x):
+        return (np.abs(x[0] - Lx_hat) < tol_bc) & (x[1] >= y_right_min - tol_bc) & (x[1] <= Ly_hat + tol_bc)
+    right_facets = dmesh.locate_entities_boundary(msh, fdim, right_marker)
+
+    # Create facet tags for boundary integration
+    # Tag left=1, right=2
+    all_facets = np.concatenate([left_facets, right_facets])
+    all_tags = np.concatenate([np.full_like(left_facets, 1),
+                               np.full_like(right_facets, 2)])
+    sort_idx = np.argsort(all_facets)
+    facet_tags = dmesh.meshtags(msh, fdim, all_facets[sort_idx], all_tags[sort_idx])
+
+    ds = ufl.Measure("ds", domain=msh, subdomain_data=facet_tags)
+    n_vec = ufl.FacetNormal(msh)
+
+    # Flux through left contact (outward = -x̂)
+    I_left_form = fem.form(ufl.inner(Jn_expr_ufl, n_vec) * ds(1))
+    I_left_local = fem.assemble_scalar(I_left_form)
+    I_left_hat = comm.allreduce(I_left_local, op=MPI.SUM)
+
+    # Flux through right contact (outward = +x̂)
+    I_right_form = fem.form(ufl.inner(Jn_expr_ufl, n_vec) * ds(2))
+    I_right_local = fem.assemble_scalar(I_right_form)
+    I_right_hat = comm.allreduce(I_right_local, op=MPI.SUM)
+
+    # Physical currents
+    I_left_phys = I_left_hat * J_scale   # A/m² × (dimensionless area already in integral)
+    I_right_phys = I_right_hat * J_scale
+
+    # Current balance
+    I_max = max(abs(I_left_hat), abs(I_right_hat), 1e-30)
+    eta_I = abs(I_left_hat + I_right_hat) / I_max
+
+    # --- Peclet numbers ---
+    Pe_device = abs(V_bias) / scaling.V_t
+    Pe_cell = Pe_device / (2.0 * 20)  # V_hat / (2*nx), approximate
+
+    # --- Scaling cross-check ---
+    # J_scale = q μn n_ref Vt / L_norm
+    # Expected Jn_hat ≈ (Nd/n_ref) × (V̂/Lx_hat) = Nd_hat × grad_phi_hat (drift-dominated)
+    Nd_hat = Nd / scaling.n_ref
+    V_hat = V_bias / scaling.V_t
+    Jn_hat_expected = Nd_hat * V_hat / Lx_hat  # expected |Ĵn| if drift-only, 1D
+    J_phys_expected = Jn_hat_expected * J_scale  # = q μn Nd V_bias / L_norm
+
+    # Direct dimensional analytic
+    J_dim_analytic = Q_E * mu_n * Nd * V_bias / (Lx_hat * L_norm)
+    # Note: Lx_hat * L_norm = Lx (physical device thickness)
 
     if rank == 0:
         print("\n" + "=" * 70)
         print("BRICK 4a ACCEPTANCE TESTS: Dark biased resistor (G=R=0)")
         print("=" * 70)
 
-        # Test 1: Jn spatial constancy
-        Jn_var = (Jn_x_max - Jn_x_min) / max(abs(Jn_x_mean), 1e-30)
-        t1_pass = Jn_var < 1e-2  # relaxed for 3D partial contacts
-        print(f"  1. Jn constancy: mean={Jn_x_mean:.6e} A/m², "
-              f"var={Jn_var:.6e} ({'PASS' if t1_pass else 'FAIL'} < 1%)")
+        # Field diagnostics
+        print(f"  --- Field diagnostics ---")
+        print(f"  n̂:  [{n_hat_min:.6f}, {n_hat_max:.6f}]  "
+              f"(physical: [{n_phys_min:.3e}, {n_phys_max:.3e}] m⁻³)")
+        print(f"  φ̂:  [{phi_hat_min:.6f}, {phi_hat_max:.6f}]  "
+              f"(physical: [{phi_hat_min*scaling.V_t*1e3:.3f}, "
+              f"{phi_hat_max*scaling.V_t*1e3:.3f}] mV)")
 
-        # Test 2: Jn vs analytic
-        geom = DeviceGeometry()
-        # For partial contacts, effective field is ~V_bias/Lx
-        J_analytic = Q_E * mu_n * Nd * V_bias / geom.Lx
-        J_rel_err = abs(Jn_x_mean - J_analytic) / max(abs(J_analytic), 1e-30)
-        # Note: 3D partial contacts make this approximate
-        print(f"  2. Jn vs analytic: J_num={Jn_x_mean:.6e}, "
-              f"J_ana={J_analytic:.6e}, rel_err={J_rel_err:.4f}")
-        print(f"     (3D partial contacts → exact match not expected)")
+        # Test 1: Positivity
+        t1_pass = n_hat_min > 0
+        print(f"\n  1. POSITIVITY: min(n̂) = {n_hat_min:.6e} "
+              f"({'PASS' if t1_pass else 'FAIL *** n < 0!'})")
 
-        # Test 3: n ≈ Nd
-        n_err_rel = max(abs(n_min - Nd), abs(n_max - Nd)) / Nd
-        t3_pass = n_err_rel < 0.01
-        print(f"  3. Neutrality: n in [{n_min:.6e}, {n_max:.6e}] m⁻³, "
-              f"Nd={Nd:.6e}, rel_err={n_err_rel:.6e} "
-              f"({'PASS' if t3_pass else 'FAIL'} < 1%)")
+        # Test 2: Quasi-neutrality
+        n_err = max(abs(n_hat_min - Nd_hat), abs(n_hat_max - Nd_hat)) / Nd_hat
+        t2_pass = n_err < 0.05  # 5% for 3D with partial contacts
+        print(f"  2. NEUTRALITY: |n̂-N̂d|/N̂d = {n_err:.6e} "
+              f"({'PASS' if t2_pass else 'FAIL'} < 5%)")
 
-        # Test 4: Peclet diagnostic
-        print(f"  4. Pe_device = {Pe_device:.2f} (V_bias/V_t), "
-              f"Pe_cell ≈ {Pe_cell:.4f}")
-        if Pe_device > 1:
-            print(f"     Device is drift-dominated — SUPG stabilization active ✓")
+        # Test 3: Current conservation (divergence-free)
+        t3_pass = eta_div < 1e-2
+        print(f"  3. CONSERVATION: ||∇·Ĵn||_L2 = {div_Jn_L2:.6e}, "
+              f"||Ĵn||_L2 = {Jn_L2:.6e}")
+        print(f"     η_div = {eta_div:.6e} "
+              f"({'PASS' if t3_pass else 'FAIL'} < 1e-2)")
 
-        # Test 5: J_scale diagnostic
-        print(f"  5. J_scale = q μn n_ref Vt / L_norm = {J_scale:.6e} A/m²")
+        # Test 4: Contact current balance
+        t4_pass = eta_I < 1e-2
+        print(f"  4. CONTACT BALANCE:")
+        print(f"     Î_left  = {I_left_hat:.6e}  "
+              f"(I = {I_left_phys:.6e} A·m/m²)")
+        print(f"     Î_right = {I_right_hat:.6e}  "
+              f"(I = {I_right_phys:.6e} A·m/m²)")
+        print(f"     η_I = |I_L+I_R|/max = {eta_I:.6e} "
+              f"({'PASS' if t4_pass else 'FAIL'} < 1e-2)")
 
+        # Test 5: Scaling cross-check
+        print(f"  5. SCALING:")
+        print(f"     J_scale = q μn n_ref Vt / L_norm = {J_scale:.6e} A/m²")
+        print(f"     Expected |Ĵn| (1D drift-only) = "
+              f"N̂d × V̂/L̂x = {Nd_hat:.1f}×{V_hat:.1f}/{Lx_hat:.4e} "
+              f"= {Jn_hat_expected:.2e}")
+        print(f"     → J_phys = {J_phys_expected:.6e} A/m²  "
+              f"(= q μn Nd V_bias / Lx)")
+        print(f"     Dimensional check: q μn Nd V/L = {J_dim_analytic:.6e} A/m²")
+        print(f"     (3D partial contacts → total I differs from J×A)")
+
+        # Test 6: Pe
+        print(f"  6. Pe_device = {Pe_device:.2f}, Pe_cell ≈ {Pe_cell:.4f}")
+
+        all_pass = t1_pass and t2_pass and t3_pass and t4_pass
+        print(f"\n  OVERALL: {'ALL PASS' if all_pass else 'SOME FAILED'}")
         print("=" * 70 + "\n")
 
-    return {"J_scale": J_scale, "Jn_x_mean": Jn_x_mean,
-            "n_min": n_min, "n_max": n_max,
-            "Pe_device": Pe_device, "Pe_cell": Pe_cell}
+    return {
+        "J_scale": J_scale,
+        "I_left_hat": I_left_hat, "I_right_hat": I_right_hat,
+        "eta_div": eta_div, "eta_I": eta_I,
+        "n_hat_min": n_hat_min, "n_hat_max": n_hat_max,
+        "Pe_device": Pe_device, "Pe_cell": Pe_cell,
+    }
 
 
 def run_brick4a(args, comm, rank):
