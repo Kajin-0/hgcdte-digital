@@ -973,16 +973,28 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     J_compiled = fem.form(J_form)
 
     # --- Allocate residual vector and Jacobian matrix ---
-    # duplicate() creates a new Vec with identical layout (size, ghosts, comm)
     b_vec = phi_hat.x.petsc_vec.duplicate()
     A_mat = fem_petsc.create_matrix(J_compiled)
+
+    # Number of locally owned DOFs (excludes ghosts)
+    _n_owned = phi_hat.function_space.dofmap.index_map.size_local
+
+    def _update_phi_from_x(X):
+        """Copy SNES vector X into phi_hat Function.
+
+        Handles both ghosted and non-ghosted X vectors by copying
+        the minimum of (X local size, n_owned) entries into owned DOFs,
+        then scatter_forward to fill ghosts.
+        """
+        x_arr = X.array_r  # read-only local array of X
+        n_copy = min(len(x_arr), _n_owned)
+        phi_hat.x.array[:n_copy] = x_arr[:n_copy]
+        phi_hat.x.scatter_forward()
 
     # --- SNES residual callback ---
     def snes_F(snes_obj, X, F_out):
         """Assemble residual F(X) into F_out."""
-        # Push SNES iterate X into phi_hat
-        X.copy(phi_hat.x.petsc_vec)
-        phi_hat.x.scatter_forward()
+        _update_phi_from_x(X)
 
         # Zero and assemble the nonlinear residual
         with F_out.localForm() as f_local:
@@ -990,9 +1002,6 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
         fem_petsc.assemble_vector(F_out, F_compiled)
 
         # BC handling for SNES:
-        # 1) apply_lifting adjusts non-BC rows for the constraint contribution.
-        #    When x satisfies BCs (x[bc] ≈ g), the correction is ~0.
-        # 2) set_bc sets BC rows to (x[bc] - g) so SNES drives them to zero.
         fem_petsc.apply_lifting(F_out, [J_compiled], bcs=[bcs],
                                 x0=[X], alpha=-1.0)
         F_out.ghostUpdate(addv=PETSc.InsertMode.ADD,
@@ -1002,9 +1011,7 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     # --- SNES Jacobian callback ---
     def snes_J(snes_obj, X, J_out, P_out):
         """Assemble Jacobian J(X) into J_out (and preconditioner P_out)."""
-        # Push SNES iterate X into phi_hat
-        X.copy(phi_hat.x.petsc_vec)
-        phi_hat.x.scatter_forward()
+        _update_phi_from_x(X)
 
         J_out.zeroEntries()
         fem_petsc.assemble_matrix(J_out, J_compiled, bcs=bcs)
