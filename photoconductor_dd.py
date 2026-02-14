@@ -2137,6 +2137,15 @@ def main():
                         help="Peak generation rate [m⁻³s⁻¹] (0=off, Brick 4c)")
     parser.add_argument("--alpha_opt", type=float, default=0.0,
                         help="Optical absorption coefficient [m⁻¹] (Brick 4c)")
+    # Brick 5: Two-carrier photoconductor
+    parser.add_argument("--brick5", action="store_true",
+                        help="Brick 5: Two-carrier photoconductor (phi fixed, Gummel)")
+    parser.add_argument("--mu_p", type=float, default=0.01,
+                        help="Hole mobility [m²/Vs]")
+    parser.add_argument("--gummel_max", type=int, default=30,
+                        help="Max Gummel iterations")
+    parser.add_argument("--gummel_tol", type=float, default=1e-6,
+                        help="Gummel convergence tolerance")
 
     args, _ = parser.parse_known_args()  # allow PETSc pass-through
 
@@ -2156,6 +2165,11 @@ def main():
     # ── Doping Sanity Mode ──
     if args.doping_sanity:
         run_doping_sanity(args, comm, rank)
+        sys.exit(0)
+
+    # ── Brick 5: Two-carrier photoconductor ──
+    if args.brick5:
+        run_brick5(args, comm, rank)
         sys.exit(0)
 
     # ── Brick 4a: Continuity with fixed phi ──
@@ -2271,6 +2285,450 @@ def main():
             print(f"XDMF export skipped: {e}")
 
     return result
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  BRICK 5: Two-carrier photoconductor (φ fixed, n + p, Gummel)
+# ════════════════════════════════════════════════════════════════════════
+#
+#  Physics:
+#    ∇·Jn = q(G - R)          electron continuity
+#    ∇·Jp = -q(G - R)         hole continuity
+#    Jn = -qμn n ∇φ + qDn ∇n
+#    Jp = -qμp p ∇φ - qDp ∇p
+#    R = (np - ni²) / (τ(n + p + 2ni))   simplified SRH
+#    G(x) = G0 exp(-α x)
+#
+#  φ is FIXED from Brick 3.
+#
+#  Nondimensionalization (n̂=n/nref, p̂=p/nref, φ̂=φ/Vt):
+#    Ĵn = -n̂ ∇̂φ̂ + ∇̂n̂
+#    Ĵp = -p̂ ∇̂φ̂ - ∇̂p̂
+#    R̂ = (n̂ p̂ - n̂i²) / (τ̂ (n̂ + p̂ + 2n̂i))
+#    Ĝ = G0_hat exp(-α̂ x̂)
+#
+#  Solver: Gummel iteration (segregated):
+#    1. Solve continuity for n̂ with p̂ fixed → compute R̂(n̂, p̂_old)
+#    2. Solve continuity for p̂ with n̂ fixed → compute R̂(n̂_new, p̂)
+#    3. Repeat until convergence
+#
+#  BCs (ohmic contacts):
+#    n̂ = Nd/nref  at contacts (majority carrier)
+#    p̂ = ni²/(Nd × nref) at contacts (minority carrier, equilibrium)
+#
+
+def _build_carrier_system(msh, scaling, dims, phi_hat, carrier_type,
+                          n_hat_fn, p_hat_fn, Nd, ni,
+                          mu, tau_n, G0, alpha_opt):
+    """
+    Build SUPG-stabilized continuity for one carrier (n or p) with the
+    other carrier FIXED (for Gummel iteration).
+
+    carrier_type: "electron" or "hole"
+
+    For electrons:
+        ∇̂·Ĵn = Ĝ - R̂
+        Weak: ∫ ∇̂n̂·∇̂w - n̂(∇̂φ̂·∇̂w) dx̂ = ∫ (Ĝ - R̂) w dx̂
+        R̂ linearized with p̂ fixed:
+            R̂ ≈ (n̂ p̂_old - n̂i²) / (τ̂(n̂ + p̂_old + 2n̂i))
+            ≈ p̂_old/(τ̂(n̂ + p̂_old + 2n̂i)) × n̂  - n̂i²/(τ̂(n̂ + p̂_old + 2n̂i))
+            For linearization, evaluate τ̂(n̂_old + p̂_old + 2n̂i) at previous values.
+            Then: R̂ ≈ r_coeff × n̂ - r_const
+            where r_coeff = p̂_old / (τ̂ denom), r_const = n̂i² / (τ̂ denom)
+
+    For holes:
+        ∇̂·Ĵp = -(Ĝ - R̂)
+        Ĵp = -p̂ ∇̂φ̂ - ∇̂p̂
+        Weak: ∫ (p̂ ∇̂φ̂ + ∇̂p̂)·∇̂w dx̂ = ∫ (Ĝ - R̂) w dx̂
+
+    Returns (A, b, bcs) ready for KSP solve into the carrier Function.
+    """
+    V = phi_hat.function_space
+    u = ufl.TrialFunction(V)
+    w = ufl.TestFunction(V)
+
+    L_norm = dims["L_norm"]
+    Nd_hat = Nd / scaling.n_ref
+    ni_hat = ni / scaling.n_ref
+
+    v = ufl.grad(phi_hat)
+    v_mag = ufl.sqrt(ufl.inner(v, v) + 1e-30)
+
+    # --- SUPG parameters ---
+    h = ufl.CellDiameter(msh)
+    Pe_local = v_mag * h / 2.0
+    xi = ufl.min_value(Pe_local / 3.0, 1.0)
+    tau_supg = (h / (2.0 * v_mag)) * xi
+    w_supg = tau_supg * ufl.inner(v, ufl.grad(w))
+
+    if carrier_type == "electron":
+        # Ĵn = -n̂ ∇̂φ̂ + ∇̂n̂  → advection v = ∇̂φ̂
+        a_gal = (ufl.inner(ufl.grad(u), ufl.grad(w)) * ufl.dx
+                 - u * ufl.inner(v, ufl.grad(w)) * ufl.dx)
+        R_trial_adv = ufl.inner(v, ufl.grad(u))
+    else:  # hole
+        # Ĵp = -p̂ ∇̂φ̂ - ∇̂p̂
+        # After IBP of ∇·Ĵp:
+        # ∫ (p̂ ∇̂φ̂ + ∇̂p̂)·∇̂w dx̂
+        # = ∫ ∇̂p̂·∇̂w dx̂ + ∫ p̂ (∇̂φ̂·∇̂w) dx̂
+        # Advection velocity for holes: -∇̂φ̂ (holes drift opposite to electrons)
+        # Actually let me re-derive:
+        # ∇·Jp = -q(G-R)
+        # Jp = -qμp p ∇φ - qDp ∇p
+        # Dimensionless: Ĵp_hat = -p̂ ∇̂φ̂ - ∇̂p̂
+        # ∇̂·Ĵp = -(Ĝ - R̂)
+        # Weak: ∫ (∇̂·Ĵp) w dx̂ = -∫ (Ĝ - R̂) w dx̂
+        # IBP: -∫ Ĵp · ∇̂w dx̂ = -∫ (Ĝ - R̂) w dx̂
+        #       ∫ (p̂ ∇̂φ̂ + ∇̂p̂) · ∇̂w dx̂ = ∫ (Ĝ - R̂) w dx̂
+        # So: a(p̂, w) = ∫ ∇̂p̂·∇̂w dx̂ + ∫ p̂ (∇̂φ̂·∇̂w) dx̂
+        a_gal = (ufl.inner(ufl.grad(u), ufl.grad(w)) * ufl.dx
+                 + u * ufl.inner(v, ufl.grad(w)) * ufl.dx)
+        # Hole advection velocity = -∇̂φ̂ (opposite direction)
+        v_hole = -v
+        w_supg = tau_supg * ufl.inner(v_hole, ufl.grad(w))
+        R_trial_adv = ufl.inner(v_hole, ufl.grad(u))
+
+    a_supg = w_supg * R_trial_adv * ufl.dx
+    a_form = a_gal + a_supg
+
+    # --- Source terms: linearized R̂ and Ĝ ---
+    L_form = fem.Constant(msh, PETSc.ScalarType(0.0)) * w * ufl.dx
+
+    tau_hat = tau_n * mu * scaling.V_t / L_norm**2 if tau_n > 0 else 1e30
+
+    if tau_n > 0:
+        # R̂ = (n̂ p̂ - n̂i²) / (τ̂ (n̂ + p̂ + 2n̂i))
+        # Linearize: evaluate denominator at previous iteration values
+        # For electron solve: n is unknown, p is fixed → p_hat_fn
+        # R̂ ≈ [p̂_old × n̂ - n̂i²] / (τ̂ × denom_old)
+        # where denom_old = n̂_old + p̂_old + 2n̂i
+        # This gives: R̂ = r_coeff × n̂ - r_const
+        #   r_coeff = p̂_old / (τ̂ × denom_old)
+        #   r_const = n̂i² / (τ̂ × denom_old)
+
+        if carrier_type == "electron":
+            other = p_hat_fn
+            self_old = n_hat_fn
+        else:
+            other = n_hat_fn
+            self_old = p_hat_fn
+
+        # denom is evaluated at old values (both carriers)
+        denom = self_old + other + 2.0 * ni_hat
+        # Avoid division by zero
+        denom_safe = ufl.max_value(denom, 1e-30)
+
+        r_coeff = other / (tau_hat * denom_safe)
+        r_const = ni_hat**2 / (tau_hat * denom_safe)
+
+        # For electron: ∇·Jn = G - R → source = G - R
+        # R = r_coeff × n̂ - r_const
+        # source = G - r_coeff × n̂ + r_const
+        # LHS gets: + r_coeff × ∫ u w dx  (reaction term)
+        # RHS gets: + r_const × ∫ w dx + ∫ Ĝ w dx
+
+        a_form += r_coeff * u * w * ufl.dx
+        # SUPG consistent reaction
+        a_form += r_coeff * w_supg * u * ufl.dx
+
+        L_form += r_const * w * ufl.dx
+        L_form += r_const * w_supg * ufl.dx
+
+    if G0 > 0:
+        G0_hat = G0 * L_norm**2 / (scaling.n_ref * mu * scaling.V_t)
+        alpha_hat_opt = alpha_opt * L_norm
+        x = ufl.SpatialCoordinate(msh)
+        G_hat = G0_hat * ufl.exp(-alpha_hat_opt * x[0])
+
+        L_form += G_hat * w * ufl.dx
+        L_form += G_hat * w_supg * ufl.dx
+
+    # --- BCs ---
+    Lx_hat = dims["Lx_hat"]
+    Ly_hat = dims["Ly_hat"]
+    y_left_max = 1000e-6 / L_norm
+    y_right_min = 2000e-6 / L_norm
+    tol_bc = 1e-8
+
+    if carrier_type == "electron":
+        bc_val = Nd_hat  # majority carrier
+    else:
+        # Minority carrier: p_eq = ni²/Nd (mass action law)
+        bc_val = ni_hat**2 / Nd_hat if Nd_hat > 0 else ni_hat
+
+    dofs_left = _locate_contact_dofs(V, msh, 0.0, 0.0, y_left_max, tol_bc)
+    bc_left = fem.dirichletbc(PETSc.ScalarType(bc_val), dofs_left, V)
+
+    dofs_right = _locate_contact_dofs(V, msh, Lx_hat, y_right_min, Ly_hat, tol_bc)
+    bc_right = fem.dirichletbc(PETSc.ScalarType(bc_val), dofs_right, V)
+
+    bcs = [bc_left, bc_right]
+
+    # Compile and assemble
+    a_compiled = fem.form(a_form)
+    L_compiled = fem.form(L_form)
+
+    A = fem_petsc.assemble_matrix(a_compiled, bcs=bcs)
+    A.assemble()
+
+    b_vec = fem_petsc.assemble_vector(L_compiled)
+    fem_petsc.apply_lifting(b_vec, [a_compiled], bcs=[bcs])
+    b_vec.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+    fem_petsc.set_bc(b_vec, bcs)
+
+    return A, b_vec, bcs
+
+
+def run_brick5(args, comm, rank):
+    """
+    Brick 5: Two-carrier photoconductor (φ fixed, Gummel iteration).
+
+    Solves electron + hole continuity with fixed φ from Brick 3.
+    Uses Gummel iteration: alternate n and p solves until self-consistent.
+    """
+    if rank == 0:
+        print("\n" + "=" * 70)
+        print("BRICK 5: Two-carrier photoconductor (φ fixed, Gummel)")
+        print("=" * 70)
+
+    scaling = make_mct_scaling_77K()
+    geom = DeviceGeometry()
+    mcfg = MeshConfig(nx=args.nx, ny=args.ny, nz=args.nz)
+    msh, dims = create_device_mesh(geom, scaling.L_ref, mcfg, comm)
+
+    L_norm = dims["L_norm"]
+    Nd_hat = args.Nd / scaling.n_ref
+    ni_hat = args.n_i / scaling.n_ref
+    mu_n = args.mu_n
+    mu_p = getattr(args, 'mu_p', 0.01)  # hole mobility, typically << mu_n
+    tau_n = getattr(args, 'tau_n', 1e-6)
+    G0 = getattr(args, 'G0', 0.0)
+    alpha_opt = getattr(args, 'alpha_opt', 0.0)
+    gummel_max = getattr(args, 'gummel_max', 30)
+    gummel_tol = getattr(args, 'gummel_tol', 1e-6)
+
+    if rank == 0:
+        print(f"  Nd = {args.Nd:.3e}, ni = {args.n_i:.3e}")
+        print(f"  mu_n = {mu_n}, mu_p = {mu_p}")
+        print(f"  tau_n = {tau_n:.3e} s")
+        print(f"  G0 = {G0:.3e} m⁻³s⁻¹, alpha = {alpha_opt:.3e} m⁻¹")
+        print(f"  V_bias = {args.V_bias} V")
+        p_eq = args.n_i**2 / args.Nd
+        print(f"  p_eq = ni²/Nd = {p_eq:.3e} m⁻³")
+        print(f"  p̂_eq = {ni_hat**2/Nd_hat:.3e}")
+
+    # Step 1: Solve Brick 3 (Poisson) for φ̂
+    if rank == 0:
+        print(f"\n  Step 1: Solving Poisson for φ̂...")
+
+    V, F_form, J_form, bcs_phi, phi_hat, phi_ref_val = build_nonlinear_poisson(
+        msh, scaling, dims, args.V_bias, args.Nd, args.Na, args.n_i
+    )
+    try:
+        solve_nonlinear_poisson(
+            F_form, J_form, phi_hat, bcs_phi, comm,
+            phi_ref_hat_value=phi_ref_val, verbose=True
+        )
+    except PoissonSolveError as e:
+        if rank == 0:
+            print(f"  Poisson FAILED: {e}")
+        return None
+
+    # Step 2: Initialize carrier densities
+    n_hat = fem.Function(V, name="n_hat")
+    p_hat = fem.Function(V, name="p_hat")
+    n_hat.x.array[:] = Nd_hat
+    p_hat.x.array[:] = ni_hat**2 / Nd_hat  # minority equilibrium
+    n_hat.x.scatter_forward()
+    p_hat.x.scatter_forward()
+
+    if rank == 0:
+        print(f"\n  Step 2: Gummel iteration (max {gummel_max} iters, tol {gummel_tol})...")
+
+    # Step 3: Gummel iteration
+    for gummel_iter in range(gummel_max):
+        # Save previous for convergence check
+        n_prev = n_hat.x.array.copy()
+        p_prev = p_hat.x.array.copy()
+
+        # Solve electron continuity (n) with p fixed
+        A_n, b_n, bcs_n = _build_carrier_system(
+            msh, scaling, dims, phi_hat, "electron",
+            n_hat, p_hat, args.Nd, args.n_i,
+            mu_n, tau_n, G0, alpha_opt
+        )
+        ksp_n = PETSc.KSP().create(comm)
+        ksp_n.setOptionsPrefix("gum_n_")
+        ksp_n.setOperators(A_n)
+        ksp_n.setType("gmres")
+        ksp_n.setTolerances(rtol=1e-8, atol=1e-12, max_it=2000)
+        ksp_n.setGMRESRestart(100)
+        pc_n = ksp_n.getPC()
+        if comm.size > 1:
+            pc_n.setType("asm")
+            ksp_n.setUp()
+            try:
+                for sub_ksp in pc_n.getASMSubKSP():
+                    sub_ksp.setType("preonly")
+                    sub_ksp.getPC().setType("ilu")
+            except Exception:
+                pass
+        else:
+            pc_n.setType("ilu")
+        ksp_n.setFromOptions()
+        ksp_n.solve(b_n, n_hat.x.petsc_vec)
+        n_hat.x.scatter_forward()
+        n_its = ksp_n.getIterationNumber()
+        ksp_n.destroy()
+        A_n.destroy()
+        b_n.destroy()
+
+        # Solve hole continuity (p) with n fixed
+        A_p, b_p, bcs_p = _build_carrier_system(
+            msh, scaling, dims, phi_hat, "hole",
+            n_hat, p_hat, args.Nd, args.n_i,
+            mu_p, tau_n, G0, alpha_opt
+        )
+        ksp_p = PETSc.KSP().create(comm)
+        ksp_p.setOptionsPrefix("gum_p_")
+        ksp_p.setOperators(A_p)
+        ksp_p.setType("gmres")
+        ksp_p.setTolerances(rtol=1e-8, atol=1e-12, max_it=2000)
+        ksp_p.setGMRESRestart(100)
+        pc_p = ksp_p.getPC()
+        if comm.size > 1:
+            pc_p.setType("asm")
+            ksp_p.setUp()
+            try:
+                for sub_ksp in pc_p.getASMSubKSP():
+                    sub_ksp.setType("preonly")
+                    sub_ksp.getPC().setType("ilu")
+            except Exception:
+                pass
+        else:
+            pc_p.setType("ilu")
+        ksp_p.setFromOptions()
+        ksp_p.solve(b_p, p_hat.x.petsc_vec)
+        p_hat.x.scatter_forward()
+        p_its = ksp_p.getIterationNumber()
+        ksp_p.destroy()
+        A_p.destroy()
+        b_p.destroy()
+
+        # Convergence check
+        n_own = V.dofmap.index_map.size_local
+        dn = np.linalg.norm(n_hat.x.array[:n_own] - n_prev[:n_own])
+        dp = np.linalg.norm(p_hat.x.array[:n_own] - p_prev[:n_own])
+        nn = np.linalg.norm(n_hat.x.array[:n_own])
+        pn = np.linalg.norm(p_hat.x.array[:n_own])
+        dn_rel = comm.allreduce(dn, op=MPI.SUM) / max(comm.allreduce(nn, op=MPI.SUM), 1e-30)
+        dp_rel = comm.allreduce(dp, op=MPI.SUM) / max(comm.allreduce(pn, op=MPI.SUM), 1e-30)
+        update = max(dn_rel, dp_rel)
+
+        if rank == 0:
+            print(f"    Gummel {gummel_iter:3d}: KSP(n)={n_its:4d} KSP(p)={p_its:4d} "
+                  f"Δn/n={dn_rel:.3e} Δp/p={dp_rel:.3e}", flush=True)
+
+        if update < gummel_tol:
+            if rank == 0:
+                print(f"  Gummel CONVERGED at iter {gummel_iter} (update={update:.3e})")
+            break
+    else:
+        if rank == 0:
+            print(f"  Gummel did NOT converge after {gummel_max} iters (update={update:.3e})")
+
+    # Step 4: Diagnostics
+    n_min = comm.allreduce(
+        n_hat.x.array[:n_own].min() if n_own > 0 else 1e30, op=MPI.MIN)
+    n_max = comm.allreduce(
+        n_hat.x.array[:n_own].max() if n_own > 0 else -1e30, op=MPI.MAX)
+    p_min = comm.allreduce(
+        p_hat.x.array[:n_own].min() if n_own > 0 else 1e30, op=MPI.MIN)
+    p_max = comm.allreduce(
+        p_hat.x.array[:n_own].max() if n_own > 0 else -1e30, op=MPI.MAX)
+
+    if rank == 0:
+        print(f"\n  --- Carrier diagnostics ---")
+        print(f"  n̂: [{n_min:.6e}, {n_max:.6e}]  (phys: [{n_min*scaling.n_ref:.3e}, {n_max*scaling.n_ref:.3e}] m⁻³)")
+        print(f"  p̂: [{p_min:.6e}, {p_max:.6e}]  (phys: [{p_min*scaling.n_ref:.3e}, {p_max*scaling.n_ref:.3e}] m⁻³)")
+        t_pos = n_min > 0 and p_min > 0
+        print(f"  Positivity: {'PASS' if t_pos else 'FAIL'}")
+
+    # Step 5: Photoconductor identity
+    # Total current = ∫_contacts (Jn + Jp)·n̂ dA = q ∫(G - R) dV
+    Jn_expr = -n_hat * ufl.grad(phi_hat) + ufl.grad(n_hat)
+    Jp_expr = -p_hat * ufl.grad(phi_hat) - ufl.grad(p_hat)
+    J_total = Jn_expr + Jp_expr
+
+    # Contact integration (reuse facet marking)
+    tdim = msh.topology.dim
+    fdim = tdim - 1
+    Lx_hat = dims["Lx_hat"]
+    Ly_hat = dims["Ly_hat"]
+    y_left_max = 1000e-6 / L_norm
+    y_right_min = 2000e-6 / L_norm
+    tol_bc = 1e-8
+
+    def left_m(x):
+        return (np.abs(x[0]) < tol_bc) & (x[1] >= -tol_bc) & (x[1] <= y_left_max + tol_bc)
+    def right_m(x):
+        return (np.abs(x[0] - Lx_hat) < tol_bc) & (x[1] >= y_right_min - tol_bc) & (x[1] <= Ly_hat + tol_bc)
+
+    lf = dmesh.locate_entities_boundary(msh, fdim, left_m)
+    rf = dmesh.locate_entities_boundary(msh, fdim, right_m)
+    af = np.concatenate([lf, rf])
+    at = np.concatenate([np.full_like(lf, 1), np.full_like(rf, 2)])
+    si = np.argsort(af)
+    ft = dmesh.meshtags(msh, fdim, af[si], at[si])
+    ds = ufl.Measure("ds", domain=msh, subdomain_data=ft)
+    nv = ufl.FacetNormal(msh)
+
+    I_left_form = fem.form(ufl.inner(J_total, nv) * ds(1))
+    I_right_form = fem.form(ufl.inner(J_total, nv) * ds(2))
+    I_left = comm.allreduce(fem.assemble_scalar(I_left_form), op=MPI.SUM)
+    I_right = comm.allreduce(fem.assemble_scalar(I_right_form), op=MPI.SUM)
+
+    # Volume integrals
+    x = ufl.SpatialCoordinate(msh)
+    vol_G = 0.0
+    vol_R = 0.0
+
+    if G0 > 0:
+        G0_hat = G0 * L_norm**2 / (scaling.n_ref * mu_n * scaling.V_t)
+        alpha_hat_opt = alpha_opt * L_norm
+        G_hat = G0_hat * ufl.exp(-alpha_hat_opt * x[0])
+        vol_G = comm.allreduce(fem.assemble_scalar(fem.form(G_hat * ufl.dx)), op=MPI.SUM)
+
+    if tau_n > 0:
+        tau_hat_n = tau_n * mu_n * scaling.V_t / L_norm**2
+        R_hat = (n_hat * p_hat - ni_hat**2) / (tau_hat_n * (n_hat + p_hat + 2*ni_hat))
+        vol_R = comm.allreduce(fem.assemble_scalar(fem.form(R_hat * ufl.dx)), op=MPI.SUM)
+
+    I_net = I_left + I_right
+    S_net = vol_G - vol_R
+    eta_vol = abs(I_net - S_net) / max(abs(I_net), abs(S_net), 1e-30)
+
+    # Physical scale
+    J_scale = Q_E * mu_n * scaling.n_ref * scaling.V_t / L_norm
+
+    if rank == 0:
+        print(f"\n  --- Photoconductor identity ---")
+        print(f"  Î_left  = {I_left:.6e}")
+        print(f"  Î_right = {I_right:.6e}")
+        print(f"  I_net   = {I_net:.6e}")
+        print(f"  ∫Ĝ dV̂  = {vol_G:.6e}")
+        print(f"  ∫R̂ dV̂  = {vol_R:.6e}")
+        print(f"  S_net   = {S_net:.6e}")
+        print(f"  η_vol   = {eta_vol:.6e} ({'PASS' if eta_vol < 0.05 else 'FAIL'} < 5%)")
+        print(f"  J_scale = {J_scale:.6e} A/m²")
+        print("=" * 70 + "\n")
+
+    return {
+        "I_left": I_left, "I_right": I_right,
+        "vol_G": vol_G, "vol_R": vol_R, "eta_vol": eta_vol,
+        "n_min": n_min, "n_max": n_max,
+        "p_min": p_min, "p_max": p_max,
+    }
 
 
 if __name__ == "__main__":
