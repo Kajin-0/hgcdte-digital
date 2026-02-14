@@ -1083,8 +1083,7 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
             print(f"  *** WARNING: >1% DOFs clamped -- solution may be physically nonsense ***")
         print(f"====================\n")
 
-    _prev_x[0].destroy()
-    snes.destroy()
+    # NonlinearProblem owns the SNES — don't destroy it here
 
     if not converged:
         raise PoissonSolveError(
