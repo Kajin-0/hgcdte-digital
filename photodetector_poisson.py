@@ -963,97 +963,37 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
                             max_newton=50, snes_rtol=1e-8, snes_atol=1e-10,
                             verbose=True):
     """
-    Solve F(phi_hat) = 0 using raw PETSc SNES with hand-written assembly
-    callbacks. No dolfinx.nls.petsc.NewtonSolver — maximum compatibility.
+    Solve F(phi_hat) = 0 using DOLFINx NonlinearProblem + PETSc SNES.
 
-    F_form, J_form: UFL forms (NOT compiled fem.form objects).
+    Uses dolfinx.fem.petsc.NonlinearProblem which correctly handles
+    all vector/matrix creation, ghost structure, and BC enforcement.
+
     phi_hat: fem.Function to solve into (initial guess on entry).
     bcs: list of DirichletBC.
 
     Returns dict with convergence info + clamp diagnostics.
     """
-    # --- Compile UFL forms ---
-    F_compiled = fem.form(F_form)
-    J_compiled = fem.form(J_form)
+    # DOLFINx NonlinearProblem handles form compilation, vector/matrix
+    # creation, and SNES callback wiring with correct ghost structure.
+    problem = fem_petsc.NonlinearProblem(F_form, phi_hat, bcs=bcs, J=J_form)
 
-    # --- Allocate residual vector and Jacobian matrix ---
-    b_vec = phi_hat.x.petsc_vec.duplicate()
-    A_mat = fem_petsc.create_matrix(J_compiled)
-
-    # Callback invocation counter for diagnostics
-    _F_call_count = [0]
-
-    def _update_phi_from_x(X):
-        """Copy SNES vector X into phi_hat using PETSc localForm (MPI-safe).
-
-        Uses localForm on both vectors to guarantee matching owned-DOF layout,
-        regardless of whether X is ghosted or non-ghosted.
-        """
-        u_vec = phi_hat.x.petsc_vec
-        with X.localForm() as xloc, u_vec.localForm() as uloc:
-            xloc.copy(uloc)
-        phi_hat.x.scatter_forward()
-
-    # --- SNES residual callback ---
-    def snes_F(snes_obj, X, F_out):
-        """Assemble residual F(X) into F_out (the vector SNES provided)."""
-        _F_call_count[0] += 1
-        _update_phi_from_x(X)
-
-        # Diagnostic: rank-0 only prints (NO MPI collectives inside callback)
-        if _F_call_count[0] <= 5 and comm.rank == 0:
-            print(f"    [F#{_F_call_count[0]}] ||X||={X.norm():.6e}",
-                  flush=True)
-
-        # Zero the SNES-provided F and assemble into it
-        F_out.set(0.0)
-        fem_petsc.assemble_vector(F_out, F_compiled)
-
-        # BC lifting + ghost accumulation + BC row enforcement
-        fem_petsc.apply_lifting(F_out, [J_compiled], bcs=[bcs],
-                                x0=[X], alpha=-1.0)
-        F_out.ghostUpdate(addv=PETSc.InsertMode.ADD,
-                          mode=PETSc.ScatterMode.REVERSE)
-        fem_petsc.set_bc(F_out, bcs, X)
-
-        # Diagnostic: print assembled ||F||
-        if _F_call_count[0] <= 5 and comm.rank == 0:
-            print(f"    [F#{_F_call_count[0]}] ||F||={F_out.norm():.6e}",
-                  flush=True)
-
-    # --- SNES Jacobian callback ---
-    def snes_J(snes_obj, X, J_out, P_out):
-        """Assemble Jacobian J(X) into J_out (and preconditioner P_out)."""
-        _update_phi_from_x(X)
-
-        J_out.zeroEntries()
-        fem_petsc.assemble_matrix(J_out, J_compiled, bcs=bcs)
-        J_out.assemble()
-
-    # --- Create and configure SNES ---
+    # Create and configure SNES
     snes = PETSc.SNES().create(comm)
-    snes.setOptionsPrefix("nl_")  # Use -nl_snes_*, -nl_ksp_*, -nl_pc_* CLI flags
-    snes.setFunction(snes_F, b_vec)
-    snes.setJacobian(snes_J, A_mat, A_mat)
+    snes.setFunction(problem.F, problem.vector)
+    snes.setJacobian(problem.J, problem.matrix)
 
-    # Set programmatic defaults (CLI flags override via setFromOptions below)
     snes.setType("newtonls")
     snes.setTolerances(rtol=snes_rtol, atol=snes_atol, max_it=max_newton)
 
-    # Line search: backtracking (bt) to prevent catastrophic full Newton steps
-    # in stiff regimes. bt will reduce step length until ||F|| decreases.
+    # Line search: backtracking
     ls = snes.getLineSearch()
     ls.setType("bt")
 
-    # Increase SNES divergence tolerance: default dtol=1e4 is too tight for
-    # stiff problems where early iterations may temporarily increase ||F||.
-    snes.setTolerances(rtol=snes_rtol, atol=snes_atol,
-                       stol=1e-8, max_it=max_newton)
-    # Set dtol separately (PETSc default 1e4 may trigger DIVERGED_DTOL too early)
+    # Raise dtol
     opts = PETSc.Options()
-    opts["nl_snes_divergence_tolerance"] = 1e10
+    opts["snes_divergence_tolerance"] = 1e10
 
-    # KSP: GMRES + AMG (GMRES safer than CG for non-SPD Jacobians)
+    # KSP: GMRES + AMG
     ksp = snes.getKSP()
     ksp.setType("gmres")
     ksp.setTolerances(rtol=1e-9, atol=1e-12, max_it=1000)
@@ -1061,12 +1001,11 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     pc.setType("hypre")
     pc.setHYPREType("boomeramg")
 
-    # Built-in monitor with Newton step diagnostic
-    _prev_x = [phi_hat.x.petsc_vec.copy()]  # mutable container for closure
+    # Monitor
+    _prev_x = [phi_hat.x.petsc_vec.copy()]
 
     def _snes_monitor(snes_obj, it, fnorm):
         if it > 0:
-            # Compute Newton step magnitude using PETSc norm (MPI-safe)
             x_new = snes_obj.getSolution()
             du = x_new.copy()
             du.axpy(-1.0, _prev_x[0])
@@ -1079,24 +1018,21 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
             du.destroy()
         elif comm.rank == 0:
             print(f"  SNES iter {it:3d} | ||F|| = {fnorm:.6e}", flush=True)
-        # Save current solution for next iteration's du computation
         snes_obj.getSolution().copy(_prev_x[0])
 
     if verbose:
         snes.setMonitor(_snes_monitor)
 
-    # CRITICAL: setFromOptions AFTER all programmatic config but BEFORE solve.
+    # setFromOptions lets CLI flags override
     snes.setFromOptions()
     ksp.setFromOptions()
 
-    # Debug: confirm SNES actually has sane tolerances
     if comm.rank == 0:
         rtol_s, atol_s, stol_s, max_it_s = snes.getTolerances()
         print(f"  [SNES config] type={snes.getType()} max_it={max_it_s} "
               f"rtol={rtol_s:.1e} atol={atol_s:.1e} "
               f"ls={ls.getType()}", flush=True)
-        print(f"  [KSP  config] type={ksp.getType()} "
-              f"pc={pc.getType()}", flush=True)
+        print(f"  [KSP  config] type={ksp.getType()} pc={pc.getType()}", flush=True)
 
     # --- Solve ---
     if comm.rank == 0:
