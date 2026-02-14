@@ -1493,7 +1493,11 @@ def compute_current_density_3d(phi_hat, n_hat, scaling, dims, mu_n, comm):
 
     # Project: Jn_hat = -n_hat * grad(phi_hat) + grad(n_hat)
     Jn_expr = -n_hat * ufl.grad(phi_hat) + ufl.grad(n_hat)
-    expr = fem.Expression(Jn_expr, V_dg.element.interpolation_points())
+    # DOLFINx version compat: interpolation_points may be property or method
+    ip = V_dg.element.interpolation_points
+    if callable(ip):
+        ip = ip()
+    expr = fem.Expression(Jn_expr, ip)
     Jn_hat.interpolate(expr)
     Jn_hat.x.scatter_forward()
 
@@ -1540,15 +1544,11 @@ def run_brick4a_tests(phi_hat, n_hat, scaling, dims, Nd, mu_n, V_bias, comm):
     n_min = comm.allreduce(np.min(n_phys) if n_own_v > 0 else 1e30, op=MPI.MIN)
     n_max = comm.allreduce(np.max(n_phys) if n_own_v > 0 else -1e30, op=MPI.MAX)
 
-    # Peclet number: Pe = |∇̂φ̂| h / 2
-    # Approximate: V̂_bias / (Lx_hat) * h_x_hat / 2
-    L_norm = dims["L_norm"]
+    # Peclet numbers
+    Pe_device = abs(V_bias) / scaling.V_t  # = V_hat, global drift/diffusion
     Lx_hat = dims["Lx_hat"]
-    V_hat = V_bias / scaling.V_t
-    grad_phi_est = abs(V_hat) / Lx_hat  # mean |∇̂φ̂|
-    # h_x = Lx / nx ≈ Lx_hat / 20 (default mesh)
-    h_x_hat = Lx_hat / 20.0  # approximate
-    Pe = grad_phi_est * h_x_hat / 2.0
+    h_x_hat = Lx_hat / 20.0  # approximate cell size
+    Pe_cell = (abs(V_bias) / scaling.V_t) / (2.0 * 20)  # V_hat / (2*nx)
 
     if rank == 0:
         print("\n" + "=" * 70)
@@ -1579,8 +1579,10 @@ def run_brick4a_tests(phi_hat, n_hat, scaling, dims, Nd, mu_n, V_bias, comm):
               f"({'PASS' if t3_pass else 'FAIL'} < 1%)")
 
         # Test 4: Peclet diagnostic
-        print(f"  4. Peclet number: Pe ≈ {Pe:.4f} "
-              f"({'CG stable' if Pe < 1 else 'NEED SG/SUPG!'})")
+        print(f"  4. Pe_device = {Pe_device:.2f} (V_bias/V_t), "
+              f"Pe_cell ≈ {Pe_cell:.4f}")
+        if Pe_device > 1:
+            print(f"     Device is drift-dominated — SUPG stabilization active ✓")
 
         # Test 5: J_scale diagnostic
         print(f"  5. J_scale = q μn n_ref Vt / L_norm = {J_scale:.6e} A/m²")
@@ -1588,7 +1590,8 @@ def run_brick4a_tests(phi_hat, n_hat, scaling, dims, Nd, mu_n, V_bias, comm):
         print("=" * 70 + "\n")
 
     return {"J_scale": J_scale, "Jn_x_mean": Jn_x_mean,
-            "n_min": n_min, "n_max": n_max, "Pe": Pe}
+            "n_min": n_min, "n_max": n_max,
+            "Pe_device": Pe_device, "Pe_cell": Pe_cell}
 
 
 def run_brick4a(args, comm, rank):
@@ -1652,16 +1655,31 @@ def run_brick4a(args, comm, rank):
 
     # Step 2: Build and solve continuity
     if rank == 0:
-        # Print Peclet number diagnostic
+        # Peclet diagnostics (dimensional and dimensionless)
         V_hat = args.V_bias / scaling.V_t
         Lx_hat = dims["Lx_hat"]
         L_norm = dims["L_norm"]
-        grad_phi_est = abs(V_hat) / Lx_hat
-        h_x_hat = Lx_hat / args.nx
-        Pe_est = grad_phi_est * h_x_hat / 2.0
+        geom = DeviceGeometry()
+
+        # DIMENSIONAL Pe: Pe_dim = |E| * L / V_t  (global drift/diffusion ratio)
+        E_est = args.V_bias / geom.Lx  # V/m
+        Pe_dim = E_est * geom.Lx / scaling.V_t
+        # This equals V_bias / V_t = V_hat
         print(f"\n  Step 2: Solving continuity for n̂...")
-        print(f"    V̂_bias = {V_hat:.2f}, |∇̂φ̂| ≈ {grad_phi_est:.1f}")
-        print(f"    Pe ≈ {Pe_est:.2f} ({'SUPG active' if Pe_est > 0.5 else 'diffusion-dominated'})")
+        print(f"    V̂_bias = {V_hat:.2f}")
+        print(f"    |E| ≈ {E_est:.2e} V/m  (= V_bias/L)")
+        print(f"    Pe_device = V_bias/V_t = {Pe_dim:.2f} "
+              f"({'drift-dominated' if Pe_dim > 1 else 'diffusion-dominated'})")
+
+        # CELL-LEVEL Pe: Pe_cell = |∇̂φ̂| * h_hat / 2
+        # |∇̂φ̂| ≈ V̂/(Lx/L_norm) in the x-direction
+        grad_phi_hat = V_hat / Lx_hat  # dimensionless gradient
+        h_hat = Lx_hat / args.nx       # dimensionless cell size in x
+        Pe_cell = grad_phi_hat * h_hat / 2.0
+        # Note: Pe_cell = (V_hat / Lx_hat) * (Lx_hat / nx) / 2 = V_hat / (2*nx)
+        print(f"    |∇̂φ̂| ≈ {grad_phi_hat:.1f}, h_hat = {h_hat:.2e}")
+        print(f"    Pe_cell = {Pe_cell:.4f} "
+              f"(SUPG needed if >0.5, current: {'YES' if Pe_cell > 0.5 else 'no'})")
 
     mu_n = args.mu_n
     V_n, A, b, bcs_n, n_hat = build_continuity_linear(
