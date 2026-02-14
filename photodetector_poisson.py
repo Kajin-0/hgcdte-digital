@@ -963,74 +963,48 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
                             max_newton=50, snes_rtol=1e-8, snes_atol=1e-10,
                             verbose=True):
     """
-    Solve F(phi_hat) = 0 using DOLFINx NonlinearProblem + PETSc SNES.
+    Solve F(phi_hat) = 0 using DOLFINx NonlinearProblem (DOLFINx 0.10).
 
-    Uses dolfinx.fem.petsc.NonlinearProblem which correctly handles
-    all vector/matrix creation, ghost structure, and BC enforcement.
-
-    phi_hat: fem.Function to solve into (initial guess on entry).
-    bcs: list of DirichletBC.
+    NonlinearProblem creates and manages its own SNES, KSP, and PC internally.
+    Configuration is done via PETSc options with the given prefix.
 
     Returns dict with convergence info + clamp diagnostics.
     """
-    # DOLFINx NonlinearProblem handles form compilation, vector/matrix
-    # creation, and SNES callback wiring with correct ghost structure.
-    problem = fem_petsc.NonlinearProblem(F_form, phi_hat, bcs=bcs, J=J_form)
-
-    # Create and configure SNES
-    snes = PETSc.SNES().create(comm)
-    snes.setFunction(problem.F, problem.vector)
-    snes.setJacobian(problem.J, problem.matrix)
-
-    snes.setType("newtonls")
-    snes.setTolerances(rtol=snes_rtol, atol=snes_atol, max_it=max_newton)
-
-    # Line search: backtracking
-    ls = snes.getLineSearch()
-    ls.setType("bt")
-
-    # Raise dtol
+    # Set PETSc options for the nonlinear solver BEFORE creating the problem
     opts = PETSc.Options()
-    opts["snes_divergence_tolerance"] = 1e10
 
-    # KSP: GMRES + AMG
-    ksp = snes.getKSP()
-    ksp.setType("gmres")
-    ksp.setTolerances(rtol=1e-9, atol=1e-12, max_it=1000)
-    pc = ksp.getPC()
-    pc.setType("hypre")
-    pc.setHYPREType("boomeramg")
-
-    # Monitor
-    _prev_x = [phi_hat.x.petsc_vec.copy()]
-
-    def _snes_monitor(snes_obj, it, fnorm):
-        if it > 0:
-            x_new = snes_obj.getSolution()
-            du = x_new.copy()
-            du.axpy(-1.0, _prev_x[0])
-            du_l2 = du.norm()
-            du_inf = du.norm(PETSc.NormType.NORM_INFINITY)
-            if comm.rank == 0:
-                print(f"  SNES iter {it:3d} | ||F|| = {fnorm:.6e} | "
-                      f"||du||_inf = {du_inf:.4f} | ||du||_2 = {du_l2:.4e}",
-                      flush=True)
-            du.destroy()
-        elif comm.rank == 0:
-            print(f"  SNES iter {it:3d} | ||F|| = {fnorm:.6e}", flush=True)
-        snes_obj.getSolution().copy(_prev_x[0])
-
+    # SNES config
+    opts["nl_snes_type"] = "newtonls"
+    opts["nl_snes_max_it"] = str(max_newton)
+    opts["nl_snes_rtol"] = str(snes_rtol)
+    opts["nl_snes_atol"] = str(snes_atol)
+    opts["nl_snes_divergence_tolerance"] = "1e10"
+    opts["nl_snes_linesearch_type"] = "bt"
     if verbose:
-        snes.setMonitor(_snes_monitor)
+        opts["nl_snes_monitor"] = ""
+        opts["nl_snes_converged_reason"] = ""
 
-    # setFromOptions lets CLI flags override
-    snes.setFromOptions()
-    ksp.setFromOptions()
+    # KSP config: GMRES + hypre/boomeramg
+    opts["nl_ksp_type"] = "gmres"
+    opts["nl_ksp_rtol"] = "1e-9"
+    opts["nl_ksp_atol"] = "1e-12"
+    opts["nl_ksp_max_it"] = "1000"
+    opts["nl_pc_type"] = "hypre"
+    opts["nl_pc_hypre_type"] = "boomeramg"
+
+    # Create NonlinearProblem — this creates SNES + wires callbacks internally
+    problem = fem_petsc.NonlinearProblem(
+        F_form, phi_hat, bcs=bcs, J=J_form,
+        petsc_options_prefix="nl_"
+    )
 
     if comm.rank == 0:
-        rtol_s, atol_s, stol_s, max_it_s = snes.getTolerances()
-        print(f"  [SNES config] type={snes.getType()} max_it={max_it_s} "
-              f"rtol={rtol_s:.1e} atol={atol_s:.1e} "
+        snes = problem._snes
+        ksp = snes.getKSP()
+        pc = ksp.getPC()
+        ls = snes.getLineSearch()
+        print(f"  [SNES config] type={snes.getType()} max_it={max_newton} "
+              f"rtol={snes_rtol:.1e} atol={snes_atol:.1e} "
               f"ls={ls.getType()}", flush=True)
         print(f"  [KSP  config] type={ksp.getType()} pc={pc.getType()}", flush=True)
 
@@ -1038,10 +1012,13 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     if comm.rank == 0:
         print(f"  Starting SNES solve...", flush=True)
     t0 = time.perf_counter()
-    snes.solve(None, phi_hat.x.petsc_vec)
+
+    # NonlinearProblem.solve() drives the SNES
+    problem.solve(phi_hat)
     phi_hat.x.scatter_forward()
     t_solve = time.perf_counter() - t0
 
+    snes = problem._snes
     n_iters = snes.getIterationNumber()
     fnorm = snes.getFunctionNorm()
     reason = snes.getConvergedReason()
