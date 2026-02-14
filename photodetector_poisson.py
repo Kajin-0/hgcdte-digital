@@ -994,17 +994,26 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     def snes_F(snes_obj, X, F_out):
         """Assemble residual F(X) into F_out (the vector SNES provided)."""
         _F_call_count[0] += 1
+
+        # Diagnostic: print X norm BEFORE copy (first 5 calls)
+        if _F_call_count[0] <= 5 and comm.rank == 0:
+            print(f"    [F#{_F_call_count[0]}] ENTER ||X||={X.norm():.6e} "
+                  f"X.local_size={X.getLocalSize()} X.size={X.getSize()}",
+                  flush=True)
+
         _update_phi_from_x(X)
 
-        # Diagnostic: verify state transfer (first 5 calls only)
-        if _F_call_count[0] <= 5 and comm.rank == 0:
-            u_vec = phi_hat.x.petsc_vec
-            diff = u_vec.duplicate()
-            u_vec.copy(diff)
-            diff.axpy(-1.0, X)
-            print(f"    [F call {_F_call_count[0]}] ||X||={X.norm():.6e} "
-                  f"||phi-X||={diff.norm():.6e}", flush=True)
-            diff.destroy()
+        # Diagnostic: verify copy worked (compare owned DOFs)
+        if _F_call_count[0] <= 5:
+            n_own = phi_hat.function_space.dofmap.index_map.size_local
+            with X.localForm() as xloc:
+                x_local = xloc.array[:n_own].copy()
+            phi_local = phi_hat.x.array[:n_own].copy()
+            local_diff = np.max(np.abs(phi_local - x_local)) if n_own > 0 else 0.0
+            global_diff = comm.allreduce(local_diff, op=MPI.MAX)
+            if comm.rank == 0:
+                print(f"    [F#{_F_call_count[0]}] COPY max|phi-X|={global_diff:.6e}",
+                      flush=True)
 
         # Zero the SNES-provided F and assemble into it
         F_out.set(0.0)
@@ -1019,7 +1028,7 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
 
         # Diagnostic: print assembled ||F|| (must match SNES gnorm)
         if _F_call_count[0] <= 5 and comm.rank == 0:
-            print(f"    [F call {_F_call_count[0]}] assembled ||F||={F_out.norm():.6e}",
+            print(f"    [F#{_F_call_count[0]}] EXIT ||F||={F_out.norm():.6e}",
                   flush=True)
 
     # --- SNES Jacobian callback ---
