@@ -1301,27 +1301,79 @@ def run_nonlinear_poisson(args, comm, rank):
 
 def build_continuity_linear(msh, scaling, dims, phi_hat, Nd, mu_n=1.0):
     """
-    Build the linear electron continuity system with φ̂ FIXED.
+    Build the SUPG-stabilized linear electron continuity system with φ̂ FIXED.
 
-    Weak form: ∫ ∇̂n̂ · ∇̂w dx̂ - ∫ n̂ (∇̂φ̂ · ∇̂w) dx̂ = 0
+    PDE (dimensionless, dark, G=R=0):
+        ∇̂·Ĵn = 0  where  Ĵn = -n̂ ∇̂φ̂ + ∇̂n̂
 
-    This is a linear problem: a(n̂, w) = L(w) with L=0.
+    This is a convection-diffusion equation in n̂:
+        -∇̂²n̂ + ∇̂φ̂ · ∇̂n̂ + (∇̂²φ̂) n̂ = 0
+    or equivalently:
+        -Δn̂ + v · ∇n̂ + σ n̂ = 0
+    where v = ∇̂φ̂ (advection velocity) and σ = ∇̂²φ̂ = Δφ̂ (reaction).
+
+    Standard Galerkin weak form:
+        ∫ ∇̂n̂ · ∇̂w dx̂ - ∫ n̂ (∇̂φ̂ · ∇̂w) dx̂ = 0
+
+    SUPG stabilization adds:
+        ∫ τ (v · ∇̂w) × R(n̂) dx̂
+    where R(n̂) = -Δn̂ + v · ∇n̂ + σ n̂ is the strong residual.
+    For a linear PDE, the trial function version:
+        R(u) = v · ∇̂u + σ u   (dropping -Δu for CG1)
+    τ_SUPG = h / (2 |v|)  × ξ(Pe)
+    where Pe = |v| h / (2 ε), ε = 1 (diffusion coeff in dimensionless units),
+    ξ(Pe) = coth(Pe) - 1/Pe  (optimal for 1D).
 
     Returns (V_n, A, b, bcs_n, n_hat).
     """
-    V_n = phi_hat.function_space  # same FE space as phi
+    V_n = phi_hat.function_space
     n_hat = fem.Function(V_n, name="n_hat")
     u_n = ufl.TrialFunction(V_n)
     w = ufl.TestFunction(V_n)
 
-    # φ̂ is a known Function — its gradient drives drift
-    grad_phi = ufl.grad(phi_hat)
+    # Advection velocity v = ∇̂φ̂
+    v = ufl.grad(phi_hat)
+    v_mag = ufl.sqrt(ufl.inner(v, v) + 1e-30)  # avoid division by zero
 
-    # Bilinear form:  a(n, w) = ∫ ∇n · ∇w dx - ∫ n (∇φ · ∇w) dx
-    a_form = (ufl.inner(ufl.grad(u_n), ufl.grad(w)) * ufl.dx
-              - u_n * ufl.inner(grad_phi, ufl.grad(w)) * ufl.dx)
+    # --- Standard Galerkin ---
+    # Diffusion + advection from IBP of ∇·(-n∇φ + ∇n) = 0:
+    #   ∫ ∇n · ∇w dx - ∫ n (∇φ · ∇w) dx = 0
+    a_galerkin = (ufl.inner(ufl.grad(u_n), ufl.grad(w)) * ufl.dx
+                  - u_n * ufl.inner(v, ufl.grad(w)) * ufl.dx)
 
-    # RHS = 0 (dark, no generation, no recombination)
+    # --- SUPG stabilization ---
+    # Cell diameter
+    h = ufl.CellDiameter(msh)
+
+    # Local Peclet number: Pe = |v| h / 2  (diffusion coeff = 1 in dimless units)
+    Pe_local = v_mag * h / 2.0
+
+    # Optimal SUPG parameter: τ = (h / (2|v|)) × ξ(Pe)
+    # ξ(Pe) = coth(Pe) - 1/Pe ≈ Pe/3 for small Pe, ≈ 1 for large Pe
+    # Use the double-asymptotic approximation:
+    #   ξ ≈ min(Pe/3, 1)  (simpler and stable)
+    xi = ufl.min_value(Pe_local / 3.0, 1.0)
+    tau_supg = (h / (2.0 * v_mag)) * xi
+
+    # Strong-form residual operator applied to trial function:
+    # R(u) = v · ∇u + σ u  where σ = Δφ̂
+    # For CG1, we drop the -Δu term (zero for linears within cells).
+    # σ = ∇²φ̂ — we approximate this via the Poisson equation:
+    # From Brick 3: ∇²φ̂ = -α_eff ρ̂, but since we only need the SUPG
+    # reaction term and it's a small correction, we set σ ≈ 0 for simplicity.
+    # The dominant stabilization comes from the advection term v · ∇u.
+    R_trial = ufl.inner(v, ufl.grad(u_n))
+
+    # SUPG test function modification: w_supg = τ (v · ∇w)
+    w_supg = tau_supg * ufl.inner(v, ufl.grad(w))
+
+    # SUPG bilinear form: ∫ w_supg × R(u) dx
+    a_supg = w_supg * R_trial * ufl.dx
+
+    # Total bilinear form
+    a_form = a_galerkin + a_supg
+
+    # RHS = 0 (dark case)
     L_form = fem.Constant(msh, PETSc.ScalarType(0.0)) * w * ufl.dx
 
     # BCs: n̂ = Nd/n_ref at ohmic contacts
@@ -1333,11 +1385,9 @@ def build_continuity_linear(msh, scaling, dims, phi_hat, Nd, mu_n=1.0):
     y_right_min = 2000e-6 / L_norm
     tol = 1e-8
 
-    # Left contact
     dofs_left = _locate_contact_dofs(V_n, msh, 0.0, 0.0, y_left_max, tol)
     bc_left = fem.dirichletbc(PETSc.ScalarType(Nd_hat), dofs_left, V_n)
 
-    # Right contact
     dofs_right = _locate_contact_dofs(V_n, msh, Lx_hat, y_right_min, Ly_hat, tol)
     bc_right = fem.dirichletbc(PETSc.ScalarType(Nd_hat), dofs_right, V_n)
 
@@ -1365,22 +1415,35 @@ def build_continuity_linear(msh, scaling, dims, phi_hat, Nd, mu_n=1.0):
 def solve_continuity(A, b, n_hat, comm, cfg=None):
     """Solve the linear continuity system An = b.
 
-    Uses CG + hypre AMG (same as Poisson).
+    Uses GMRES + ILU (nonsymmetric convection-diffusion operator).
+    NOT CG — the operator is nonsymmetric due to the drift term.
     """
-    if cfg is None:
-        cfg = SolverConfig()
-
     ksp = PETSc.KSP().create(comm)
-    ksp.setOptionsPrefix("cont_")  # separate from Poisson KSP
+    ksp.setOptionsPrefix("cont_")
     ksp.setOperators(A)
-    ksp.setType(cfg.ksp_type)
-    ksp.setTolerances(rtol=cfg.rtol, atol=cfg.atol, max_it=cfg.max_iter)
-    pc = ksp.getPC()
-    pc.setType(cfg.pc_type)
-    if cfg.pc_type == "hypre":
-        pc.setHYPREType(cfg.pc_hypre_type)
-    ksp.setFromOptions()
+    ksp.setType("gmres")
+    ksp.setTolerances(rtol=1e-8, atol=1e-12, max_it=2000)
+    # GMRES restart (default 30 may be too small for nonsymmetric problems)
+    ksp.setGMRESRestart(100)
 
+    pc = ksp.getPC()
+    # For parallel: use ASM (additive Schwarz) with ILU sub-blocks
+    # For serial: use ILU directly
+    if comm.size > 1:
+        pc.setType("asm")
+        # Sub-solver: ILU on each subdomain
+        ksp.setUp()
+        try:
+            for sub_ksp in pc.getASMSubKSP():
+                sub_ksp.setType("preonly")
+                sub_pc = sub_ksp.getPC()
+                sub_pc.setType("ilu")
+        except Exception:
+            pass  # fallback: default sub-solvers
+    else:
+        pc.setType("ilu")
+
+    ksp.setFromOptions()
     ksp.solve(b, n_hat.x.petsc_vec)
     n_hat.x.scatter_forward()
 
@@ -1589,13 +1652,34 @@ def run_brick4a(args, comm, rank):
 
     # Step 2: Build and solve continuity
     if rank == 0:
+        # Print Peclet number diagnostic
+        V_hat = args.V_bias / scaling.V_t
+        Lx_hat = dims["Lx_hat"]
+        L_norm = dims["L_norm"]
+        grad_phi_est = abs(V_hat) / Lx_hat
+        h_x_hat = Lx_hat / args.nx
+        Pe_est = grad_phi_est * h_x_hat / 2.0
         print(f"\n  Step 2: Solving continuity for n̂...")
+        print(f"    V̂_bias = {V_hat:.2f}, |∇̂φ̂| ≈ {grad_phi_est:.1f}")
+        print(f"    Pe ≈ {Pe_est:.2f} ({'SUPG active' if Pe_est > 0.5 else 'diffusion-dominated'})")
 
     mu_n = args.mu_n
     V_n, A, b, bcs_n, n_hat = build_continuity_linear(
         msh, scaling, dims, phi_hat, args.Nd, mu_n
     )
     solve_continuity(A, b, n_hat, comm)
+
+    # n-positivity check (all ranks)
+    n_own_v = V_n.dofmap.index_map.size_local
+    n_arr = n_hat.x.array[:n_own_v]
+    n_min_local = n_arr.min() if n_own_v > 0 else 1e30
+    n_min_global = comm.allreduce(n_min_local, op=MPI.MIN)
+    if rank == 0:
+        if n_min_global < 0:
+            print(f"  *** WARNING: n̂ < 0 detected! min(n̂) = {n_min_global:.6e} ***")
+            print(f"  *** This indicates numerical oscillation — need stronger stabilization ***")
+        else:
+            print(f"  n̂ > 0 everywhere: min(n̂) = {n_min_global:.6e} ✓")
 
     # Step 3: Acceptance tests
     if rank == 0:
