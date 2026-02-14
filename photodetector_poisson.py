@@ -976,37 +976,51 @@ def solve_nonlinear_poisson(F_form, J_form, phi_hat, bcs, comm,
     b_vec = phi_hat.x.petsc_vec.duplicate()
     A_mat = fem_petsc.create_matrix(J_compiled)
 
-    # Number of locally owned DOFs (excludes ghosts)
-    _n_owned = phi_hat.function_space.dofmap.index_map.size_local
+    # Callback invocation counter for diagnostics
+    _F_call_count = [0]
 
     def _update_phi_from_x(X):
-        """Copy SNES vector X into phi_hat Function.
+        """Copy SNES vector X into phi_hat using PETSc localForm (MPI-safe).
 
-        Handles both ghosted and non-ghosted X vectors by copying
-        the minimum of (X local size, n_owned) entries into owned DOFs,
-        then scatter_forward to fill ghosts.
+        Uses localForm on both vectors to guarantee matching owned-DOF layout,
+        regardless of whether X is ghosted or non-ghosted.
         """
-        x_arr = X.array_r  # read-only local array of X
-        n_copy = min(len(x_arr), _n_owned)
-        phi_hat.x.array[:n_copy] = x_arr[:n_copy]
+        u_vec = phi_hat.x.petsc_vec
+        with X.localForm() as xloc, u_vec.localForm() as uloc:
+            xloc.copy(uloc)
         phi_hat.x.scatter_forward()
 
     # --- SNES residual callback ---
     def snes_F(snes_obj, X, F_out):
-        """Assemble residual F(X) into F_out."""
+        """Assemble residual F(X) into F_out (the vector SNES provided)."""
+        _F_call_count[0] += 1
         _update_phi_from_x(X)
 
-        # Zero and assemble the nonlinear residual
-        with F_out.localForm() as f_local:
-            f_local.set(0.0)
+        # Diagnostic: verify state transfer (first 5 calls only)
+        if _F_call_count[0] <= 5 and comm.rank == 0:
+            u_vec = phi_hat.x.petsc_vec
+            diff = u_vec.duplicate()
+            u_vec.copy(diff)
+            diff.axpy(-1.0, X)
+            print(f"    [F call {_F_call_count[0]}] ||X||={X.norm():.6e} "
+                  f"||phi-X||={diff.norm():.6e}", flush=True)
+            diff.destroy()
+
+        # Zero the SNES-provided F and assemble into it
+        F_out.set(0.0)
         fem_petsc.assemble_vector(F_out, F_compiled)
 
-        # BC handling for SNES:
+        # BC lifting + ghost accumulation + BC row enforcement
         fem_petsc.apply_lifting(F_out, [J_compiled], bcs=[bcs],
                                 x0=[X], alpha=-1.0)
         F_out.ghostUpdate(addv=PETSc.InsertMode.ADD,
                           mode=PETSc.ScatterMode.REVERSE)
         fem_petsc.set_bc(F_out, bcs, X)
+
+        # Diagnostic: print assembled ||F|| (must match SNES gnorm)
+        if _F_call_count[0] <= 5 and comm.rank == 0:
+            print(f"    [F call {_F_call_count[0]}] assembled ||F||={F_out.norm():.6e}",
+                  flush=True)
 
     # --- SNES Jacobian callback ---
     def snes_J(snes_obj, X, J_out, P_out):
