@@ -1299,82 +1299,113 @@ def run_nonlinear_poisson(args, comm, rank):
 #    3) n ≈ Nd everywhere (quasi-neutrality, dark)
 #    4) Jn = 0 when V_bias = 0
 
-def build_continuity_linear(msh, scaling, dims, phi_hat, Nd, mu_n=1.0):
+def build_continuity_linear(msh, scaling, dims, phi_hat, Nd, mu_n=1.0,
+                            tau_n=0.0, G0=0.0, alpha_opt=0.0):
     """
     Build the SUPG-stabilized linear electron continuity system with φ̂ FIXED.
 
-    PDE (dimensionless, dark, G=R=0):
-        ∇̂·Ĵn = 0  where  Ĵn = -n̂ ∇̂φ̂ + ∇̂n̂
+    PDE (dimensionless):
+        ∇̂·Ĵn = Ŝ    where  Ĵn = -n̂ ∇̂φ̂ + ∇̂n̂
+        Ŝ = Ĝ - R̂   (generation minus recombination, nondimensionalized)
 
-    This is a convection-diffusion equation in n̂:
-        -∇̂²n̂ + ∇̂φ̂ · ∇̂n̂ + (∇̂²φ̂) n̂ = 0
-    or equivalently:
-        -Δn̂ + v · ∇n̂ + σ n̂ = 0
-    where v = ∇̂φ̂ (advection velocity) and σ = ∇̂²φ̂ = Δφ̂ (reaction).
+    Nondimensionalization of source terms:
+        The continuity equation ∇·Jn = q(G - R) in physical units becomes,
+        after dividing by (q μn n_ref Vt / L_norm²):
+            ∇̂·Ĵn = Ĝ - R̂
+        where:
+            R̂ = (n̂ - n̂₀) / τ̂    with τ̂ = τ_n × (μn Vt / L_norm²)
+            Ĝ = G0 × (L_norm² / (n_ref μn Vt)) × exp(-α̂ x̂₀)
+            α̂ = alpha_opt × L_norm
 
-    Standard Galerkin weak form:
-        ∫ ∇̂n̂ · ∇̂w dx̂ - ∫ n̂ (∇̂φ̂ · ∇̂w) dx̂ = 0
+    Brick 4a: tau_n=0, G0=0 → pure dark resistor
+    Brick 4b: tau_n>0, G0=0 → dark with recombination
+    Brick 4c: tau_n>0, G0>0  → illuminated photoconductor
 
-    SUPG stabilization adds:
-        ∫ τ (v · ∇̂w) × R(n̂) dx̂
-    where R(n̂) = -Δn̂ + v · ∇n̂ + σ n̂ is the strong residual.
-    For a linear PDE, the trial function version:
-        R(u) = v · ∇̂u + σ u   (dropping -Δu for CG1)
-    τ_SUPG = h / (2 |v|)  × ξ(Pe)
-    where Pe = |v| h / (2 ε), ε = 1 (diffusion coeff in dimensionless units),
-    ξ(Pe) = coth(Pe) - 1/Pe  (optimal for 1D).
+    With R linear in n̂, the problem remains LINEAR in n̂:
+        a(n̂, w) = L(w) + source terms
 
-    Returns (V_n, A, b, bcs_n, n_hat).
+    Returns (V_n, A, b, bcs_n, n_hat, source_info).
     """
     V_n = phi_hat.function_space
     n_hat = fem.Function(V_n, name="n_hat")
     u_n = ufl.TrialFunction(V_n)
     w = ufl.TestFunction(V_n)
 
+    L_norm = dims["L_norm"]
+    Nd_hat = Nd / scaling.n_ref
+
     # Advection velocity v = ∇̂φ̂
     v = ufl.grad(phi_hat)
-    v_mag = ufl.sqrt(ufl.inner(v, v) + 1e-30)  # avoid division by zero
+    v_mag = ufl.sqrt(ufl.inner(v, v) + 1e-30)
 
     # --- Standard Galerkin ---
-    # Diffusion + advection from IBP of ∇·(-n∇φ + ∇n) = 0:
-    #   ∫ ∇n · ∇w dx - ∫ n (∇φ · ∇w) dx = 0
     a_galerkin = (ufl.inner(ufl.grad(u_n), ufl.grad(w)) * ufl.dx
                   - u_n * ufl.inner(v, ufl.grad(w)) * ufl.dx)
 
     # --- SUPG stabilization ---
-    # Cell diameter
     h = ufl.CellDiameter(msh)
-
-    # Local Peclet number: Pe = |v| h / 2  (diffusion coeff = 1 in dimless units)
     Pe_local = v_mag * h / 2.0
-
-    # Optimal SUPG parameter: τ = (h / (2|v|)) × ξ(Pe)
-    # ξ(Pe) = coth(Pe) - 1/Pe ≈ Pe/3 for small Pe, ≈ 1 for large Pe
-    # Use the double-asymptotic approximation:
-    #   ξ ≈ min(Pe/3, 1)  (simpler and stable)
     xi = ufl.min_value(Pe_local / 3.0, 1.0)
     tau_supg = (h / (2.0 * v_mag)) * xi
 
-    # Strong-form residual operator applied to trial function:
-    # R(u) = v · ∇u + σ u  where σ = Δφ̂
-    # For CG1, we drop the -Δu term (zero for linears within cells).
-    # σ = ∇²φ̂ — we approximate this via the Poisson equation:
-    # From Brick 3: ∇²φ̂ = -α_eff ρ̂, but since we only need the SUPG
-    # reaction term and it's a small correction, we set σ ≈ 0 for simplicity.
-    # The dominant stabilization comes from the advection term v · ∇u.
     R_trial = ufl.inner(v, ufl.grad(u_n))
-
-    # SUPG test function modification: w_supg = τ (v · ∇w)
     w_supg = tau_supg * ufl.inner(v, ufl.grad(w))
-
-    # SUPG bilinear form: ∫ w_supg × R(u) dx
     a_supg = w_supg * R_trial * ufl.dx
 
-    # Total bilinear form
-    a_form = a_galerkin + a_supg
+    # --- Recombination: R = (n - n0) / τ_n ---
+    # In weak form: ∇̂·Ĵn = Ĝ - R̂
+    # After IBP:  a(n,w) = ∫ Ŝ w dx̂
+    # R̂ = (n̂ - n̂₀)/τ̂  is linear in n̂ → moves to LHS:
+    #   a(n,w) += (1/τ̂) ∫ n̂ w dx̂    (adds "reaction" to bilinear form)
+    #   L(w)   += (n̂₀/τ̂) ∫ w dx̂     (adds constant to RHS)
 
-    # RHS = 0 (dark case)
+    source_info = {"tau_hat": 0.0, "G0_hat": 0.0, "alpha_hat": 0.0,
+                   "has_recomb": False, "has_gen": False}
+
+    a_recomb = fem.Constant(msh, PETSc.ScalarType(0.0)) * u_n * w * ufl.dx
     L_form = fem.Constant(msh, PETSc.ScalarType(0.0)) * w * ufl.dx
+
+    if tau_n > 0:
+        tau_hat = tau_n * mu_n * scaling.V_t / L_norm**2
+        n0_hat = Nd_hat  # dark equilibrium for n-type
+        source_info["tau_hat"] = tau_hat
+        source_info["has_recomb"] = True
+
+        # Reaction term: (1/τ̂) ∫ n̂ w dx̂ added to bilinear form
+        inv_tau = fem.Constant(msh, PETSc.ScalarType(1.0 / tau_hat))
+        a_recomb = inv_tau * u_n * w * ufl.dx
+
+        # RHS contribution: (n̂₀/τ̂) ∫ w dx̂
+        src_recomb = fem.Constant(msh, PETSc.ScalarType(n0_hat / tau_hat))
+        L_form = src_recomb * w * ufl.dx
+
+        # SUPG consistent source: add τ(v·∇w) × (source) for consistency
+        # For recombination: strong-form source = -R̂ = -(n̂ - n̂₀)/τ̂
+        # Trial part: -(1/τ̂) u_n  → goes to LHS as SUPG reaction
+        a_recomb += inv_tau * w_supg * u_n * ufl.dx
+        # Constant part: n̂₀/τ̂ → goes to RHS SUPG
+        L_form += src_recomb * w_supg * ufl.dx
+
+    # --- Generation: G(x) = G0 exp(-α x) ---
+    if G0 > 0:
+        G0_hat = G0 * L_norm**2 / (scaling.n_ref * mu_n * scaling.V_t)
+        alpha_hat_opt = alpha_opt * L_norm
+        source_info["G0_hat"] = G0_hat
+        source_info["alpha_hat"] = alpha_hat_opt
+        source_info["has_gen"] = True
+
+        x = ufl.SpatialCoordinate(msh)
+        # Generation depends on x[0] (thickness direction)
+        G_hat_expr = fem.Constant(msh, PETSc.ScalarType(G0_hat)) * ufl.exp(
+            fem.Constant(msh, PETSc.ScalarType(-alpha_hat_opt)) * x[0])
+
+        # Adds to RHS: ∫ Ĝ w dx̂
+        L_form += G_hat_expr * w * ufl.dx
+        # SUPG consistent: ∫ Ĝ × τ(v·∇w) dx̂
+        L_form += G_hat_expr * w_supg * ufl.dx
+
+    # Total bilinear form (including recombination reaction term)
+    a_form = a_galerkin + a_supg + a_recomb
 
     # BCs: n̂ = Nd/n_ref at ohmic contacts
     Nd_hat = Nd / scaling.n_ref
@@ -1409,7 +1440,7 @@ def build_continuity_linear(msh, scaling, dims, phi_hat, Nd, mu_n=1.0):
     n_hat.x.array[:] = Nd_hat
     n_hat.x.scatter_forward()
 
-    return V_n, A, b, bcs_n, n_hat
+    return V_n, A, b, bcs_n, n_hat, source_info
 
 
 def solve_continuity(A, b, n_hat, comm, cfg=None):
@@ -1508,7 +1539,8 @@ def compute_current_density_3d(phi_hat, n_hat, scaling, dims, mu_n, comm):
     return J_scale, Jn_hat
 
 
-def run_brick4a_tests(phi_hat, n_hat, scaling, dims, Nd, mu_n, V_bias, comm):
+def run_brick4a_tests(phi_hat, n_hat, scaling, dims, Nd, mu_n, V_bias, comm,
+                      tau_n=0.0, G0=0.0, alpha_opt=0.0, source_info=None):
     """
     Brick 4a acceptance tests for dark biased resistor.
 
@@ -1620,6 +1652,42 @@ def run_brick4a_tests(phi_hat, n_hat, scaling, dims, Nd, mu_n, V_bias, comm):
     I_max = max(abs(I_left_hat), abs(I_right_hat), 1e-30)
     eta_I = abs(I_left_hat + I_right_hat) / I_max
 
+    # --- Volume balance for Bricks 4b/4c ---
+    # Global identity: ∫_∂Ω Jn·n̂ dA = ∫_Ω (G - R) dV
+    # i.e. I_left + I_right = ∫(Ĝ - R̂) dV̂
+    vol_G_hat = 0.0   # ∫ Ĝ dV̂
+    vol_R_hat = 0.0   # ∫ R̂ dV̂
+    vol_balance_valid = False
+
+    if source_info is not None and (source_info.get("has_recomb") or source_info.get("has_gen")):
+        vol_balance_valid = True
+
+        if source_info.get("has_recomb") and source_info["tau_hat"] > 0:
+            # R̂ = (n̂ - n̂₀) / τ̂
+            n0_hat = Nd / scaling.n_ref
+            tau_hat = source_info["tau_hat"]
+            R_hat_expr = (n_hat - n0_hat) / tau_hat
+            R_form = fem.form(R_hat_expr * ufl.dx)
+            vol_R_local = fem.assemble_scalar(R_form)
+            vol_R_hat = comm.allreduce(vol_R_local, op=MPI.SUM)
+
+        if source_info.get("has_gen") and source_info["G0_hat"] > 0:
+            G0_hat = source_info["G0_hat"]
+            alpha_hat_opt = source_info["alpha_hat"]
+            x = ufl.SpatialCoordinate(msh)
+            G_hat_expr = G0_hat * ufl.exp(-alpha_hat_opt * x[0])
+            G_form = fem.form(G_hat_expr * ufl.dx)
+            vol_G_local = fem.assemble_scalar(G_form)
+            vol_G_hat = comm.allreduce(vol_G_local, op=MPI.SUM)
+
+    # Volume balance metric
+    I_net_hat = I_left_hat + I_right_hat
+    S_net_hat = vol_G_hat - vol_R_hat
+    if vol_balance_valid:
+        eta_vol = abs(I_net_hat - S_net_hat) / max(abs(I_net_hat), abs(S_net_hat), 1e-30)
+    else:
+        eta_vol = 0.0
+
     # --- Peclet numbers ---
     Pe_device = abs(V_bias) / scaling.V_t
     Pe_cell = Pe_device / (2.0 * 20)  # V_hat / (2*nx), approximate
@@ -1691,7 +1759,19 @@ def run_brick4a_tests(phi_hat, n_hat, scaling, dims, Nd, mu_n, V_bias, comm):
         # Test 6: Pe
         print(f"  6. Pe_device = {Pe_device:.2f}, Pe_cell ≈ {Pe_cell:.4f}")
 
-        all_pass = t1_pass and t2_pass and t3_pass and t4_pass
+        # Test 7: Volume balance (Bricks 4b/4c only)
+        t7_pass = True
+        if vol_balance_valid:
+            t7_pass = eta_vol < 1e-2
+            print(f"  7. VOLUME BALANCE (photoconductor identity):")
+            print(f"     ∫Ĝ dV̂ = {vol_G_hat:.6e}")
+            print(f"     ∫R̂ dV̂ = {vol_R_hat:.6e}")
+            print(f"     I_net (contacts) = {I_net_hat:.6e}")
+            print(f"     S_net (∫(G-R)) = {S_net_hat:.6e}")
+            print(f"     η_vol = |I_net - S_net|/max = {eta_vol:.6e} "
+                  f"({'PASS' if t7_pass else 'FAIL'} < 1e-2)")
+
+        all_pass = t1_pass and t2_pass and t3_pass and t4_pass and t7_pass
         print(f"\n  OVERALL: {'ALL PASS' if all_pass else 'SOME FAILED'}")
         print("=" * 70 + "\n")
 
@@ -1715,8 +1795,17 @@ def run_brick4a(args, comm, rank):
     5. Run acceptance tests
     """
     if rank == 0:
+        # Determine which brick level
+        tau_n = getattr(args, 'tau_n', 0.0)
+        G0 = getattr(args, 'G0', 0.0)
+        if G0 > 0:
+            brick_label = "4c: Illuminated photoconductor (G>0, R>0)"
+        elif tau_n > 0:
+            brick_label = "4b: Dark with recombination (R>0)"
+        else:
+            brick_label = "4a: Dark biased resistor (G=R=0)"
         print("\n" + "=" * 70)
-        print("BRICK 4a: Electron continuity (φ̂ fixed, dark, G=R=0)")
+        print(f"BRICK {brick_label}")
         print("=" * 70)
 
     scaling = make_mct_scaling_77K()
@@ -1734,6 +1823,14 @@ def run_brick4a(args, comm, rank):
         print(f"  Nd  = {args.Nd:.3e} m⁻³ (Nd/n_ref = {args.Nd/scaling.n_ref:.6e})")
         print(f"  V_bias = {args.V_bias} V")
         print(f"  mu_n = {args.mu_n} m²/Vs")
+        tau_n_val = getattr(args, 'tau_n', 0.0)
+        G0_val = getattr(args, 'G0', 0.0)
+        alpha_val = getattr(args, 'alpha_opt', 0.0)
+        if tau_n_val > 0:
+            print(f"  tau_n = {tau_n_val:.3e} s")
+        if G0_val > 0:
+            print(f"  G0 = {G0_val:.3e} m⁻³s⁻¹")
+            print(f"  alpha_opt = {alpha_val:.3e} m⁻¹")
 
     # Step 1: Solve Brick 3 (Poisson) for φ̂
     if rank == 0:
@@ -1792,9 +1889,25 @@ def run_brick4a(args, comm, rank):
               f"(SUPG needed if >0.5, current: {'YES' if Pe_cell > 0.5 else 'no'})")
 
     mu_n = args.mu_n
-    V_n, A, b, bcs_n, n_hat = build_continuity_linear(
-        msh, scaling, dims, phi_hat, args.Nd, mu_n
+    tau_n = getattr(args, 'tau_n', 0.0)
+    G0 = getattr(args, 'G0', 0.0)
+    alpha_opt = getattr(args, 'alpha_opt', 0.0)
+    V_n, A, b, bcs_n, n_hat, source_info = build_continuity_linear(
+        msh, scaling, dims, phi_hat, args.Nd, mu_n,
+        tau_n=tau_n, G0=G0, alpha_opt=alpha_opt
     )
+
+    if rank == 0 and (source_info["has_recomb"] or source_info["has_gen"]):
+        print(f"    --- Source terms ---")
+        if source_info["has_recomb"]:
+            print(f"    τ̂ = {source_info['tau_hat']:.6e}  "
+                  f"(τ_n = {tau_n:.3e} s)")
+        if source_info["has_gen"]:
+            print(f"    Ĝ₀ = {source_info['G0_hat']:.6e}  "
+                  f"(G0 = {G0:.3e} m⁻³s⁻¹)")
+            print(f"    α̂ = {source_info['alpha_hat']:.4f}  "
+                  f"(α_opt = {alpha_opt:.3e} m⁻¹)")
+
     solve_continuity(A, b, n_hat, comm)
 
     # n-positivity check (all ranks)
@@ -1814,7 +1927,8 @@ def run_brick4a(args, comm, rank):
         print(f"  Step 3: Running acceptance tests...")
 
     results = run_brick4a_tests(
-        phi_hat, n_hat, scaling, dims, args.Nd, mu_n, args.V_bias, comm
+        phi_hat, n_hat, scaling, dims, args.Nd, mu_n, args.V_bias, comm,
+        tau_n=tau_n, G0=G0, alpha_opt=alpha_opt, source_info=source_info
     )
 
     return results
@@ -2016,6 +2130,13 @@ def main():
                         help="Brick 4a: Electron continuity (phi fixed, dark)")
     parser.add_argument("--mu_n", type=float, default=1.0,
                         help="Electron mobility [m²/Vs]")
+    # Brick 4b/4c: Recombination and generation
+    parser.add_argument("--tau_n", type=float, default=0.0,
+                        help="Electron lifetime [s] (0=off, Brick 4b)")
+    parser.add_argument("--G0", type=float, default=0.0,
+                        help="Peak generation rate [m⁻³s⁻¹] (0=off, Brick 4c)")
+    parser.add_argument("--alpha_opt", type=float, default=0.0,
+                        help="Optical absorption coefficient [m⁻¹] (Brick 4c)")
 
     args, _ = parser.parse_known_args()  # allow PETSc pass-through
 
