@@ -1426,6 +1426,182 @@ def run_nd_continuation(args, comm, rank):
 
 
 # ════════════════════════════════════════════════════════════════════════
+#  SOLUTION EXPORT: CSV and PNG Visualization
+# ════════════════════════════════════════════════════════════════════════
+
+def export_solution_to_csv(phi_hat, V, scaling, dims, out_dir, comm, rank):
+    """Export solution to CSV format."""
+    # Get DOF coordinates and values
+    coords = V.tabulate_dof_coordinates()
+    phi_values = phi_hat.x.array * scaling.V_t  # Convert to physical units (V)
+    
+    # Convert coordinates to physical units (meters)
+    L_norm = dims['L_norm']
+    coords_phys = coords * L_norm
+    
+    # Gather all data to rank 0
+    all_coords = comm.gather(coords_phys, root=0)
+    all_phi = comm.gather(phi_values, root=0)
+    
+    if rank == 0:
+        # Concatenate data from all ranks
+        coords_global = np.concatenate(all_coords)
+        phi_global = np.concatenate(all_phi)
+        
+        # Save to CSV
+        csv_path = out_dir / "solution_data.csv"
+        with open(csv_path, 'w') as f:
+            f.write("x_m,y_m,z_m,phi_V\n")
+            for i in range(len(phi_global)):
+                f.write(f"{coords_global[i,0]:.12e},{coords_global[i,1]:.12e},"
+                       f"{coords_global[i,2]:.12e},{phi_global[i]:.12e}\n")
+        
+        print(f"\nSolution exported to {csv_path}")
+        print(f"  {len(phi_global)} data points")
+
+
+def plot_solution(csv_path, out_dir, V_bias):
+    """Generate PNG visualizations of the solution."""
+    try:
+        import pandas as pd
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import LinearSegmentedColormap
+    except ImportError as e:
+        print(f"Warning: Cannot generate plots - {e}")
+        return
+    
+    print("\nGenerating visualization plots...")
+    
+    # Load data
+    df = pd.read_csv(csv_path)
+    
+    # Create figures directory
+    fig_dir = out_dir / "figures"
+    fig_dir.mkdir(exist_ok=True)
+    
+    # ── Plot 1: Mid-plane (z = Lz/2) potential map ──
+    print("  - Generating mid-plane potential map...")
+    
+    # Find points closest to mid-plane
+    z_mid = df['z_m'].median()
+    z_tolerance = (df['z_m'].max() - df['z_m'].min()) / 20
+    df_midplane = df[np.abs(df['z_m'] - z_mid) < z_tolerance].copy()
+    
+    # Create 2D scatter plot
+    fig, ax = plt.subplots(figsize=(10, 4))
+    scatter = ax.scatter(df_midplane['y_m']*1e6, df_midplane['x_m']*1e6, 
+                        c=df_midplane['phi_V'], cmap='viridis', s=1)
+    ax.set_xlabel('Length y (µm)', fontsize=12)
+    ax.set_ylabel('Thickness x (µm)', fontsize=12)
+    ax.set_title(f'Potential Distribution (mid-plane, V_bias = {V_bias} V)', fontsize=13)
+    cbar = plt.colorbar(scatter, ax=ax, label='Potential φ (V)')
+    ax.set_aspect('equal')
+    plt.tight_layout()
+    plt.savefig(fig_dir / 'potential_midplane.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"    ✓ Saved: {fig_dir / 'potential_midplane.png'}")
+    
+    # ── Plot 2: Cross-section (x = Lx/2) ──
+    print("  - Generating cross-section view...")
+    
+    x_mid = df['x_m'].median()
+    x_tolerance = (df['x_m'].max() - df['x_m'].min()) / 20
+    df_cross = df[np.abs(df['x_m'] - x_mid) < x_tolerance].copy()
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    scatter = ax.scatter(df_cross['y_m']*1e6, df_cross['z_m']*1e6,
+                        c=df_cross['phi_V'], cmap='viridis', s=1)
+    ax.set_xlabel('Length y (µm)', fontsize=12)
+    ax.set_ylabel('Width z (µm)', fontsize=12)
+    ax.set_title(f'Potential Distribution (cross-section, V_bias = {V_bias} V)', fontsize=13)
+    cbar = plt.colorbar(scatter, ax=ax, label='Potential φ (V)')
+    ax.set_aspect('equal')
+    plt.tight_layout()
+    plt.savefig(fig_dir / 'potential_crosssection.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"    ✓ Saved: {fig_dir / 'potential_crosssection.png'}")
+    
+    # ── Plot 3: 1D line plot along device length (centerline) ──
+    print("  - Generating 1D potential profile...")
+    
+    # Find centerline points
+    x_center = df['x_m'].median()
+    z_center = df['z_m'].median()
+    tolerance_x = (df['x_m'].max() - df['x_m'].min()) / 20
+    tolerance_z = (df['z_m'].max() - df['z_m'].min()) / 20
+    
+    df_line = df[(np.abs(df['x_m'] - x_center) < tolerance_x) & 
+                 (np.abs(df['z_m'] - z_center) < tolerance_z)].copy()
+    df_line = df_line.sort_values('y_m')
+    
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(df_line['y_m']*1e6, df_line['phi_V'], 'b-', linewidth=2)
+    ax.set_xlabel('Length y (µm)', fontsize=12)
+    ax.set_ylabel('Potential φ (V)', fontsize=12)
+    ax.set_title(f'Potential Profile Along Device Length (V_bias = {V_bias} V)', fontsize=13)
+    ax.grid(True, alpha=0.3)
+    ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+    ax.axhline(y=V_bias, color='gray', linestyle='--', alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(fig_dir / 'potential_profile_1D.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"    ✓ Saved: {fig_dir / 'potential_profile_1D.png'}")
+    
+    # ── Plot 4: Statistical summary ──
+    print("  - Generating statistical summary...")
+    
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 10))
+    
+    # Histogram
+    ax1.hist(df['phi_V'], bins=50, color='steelblue', edgecolor='black', alpha=0.7)
+    ax1.set_xlabel('Potential φ (V)', fontsize=11)
+    ax1.set_ylabel('Frequency', fontsize=11)
+    ax1.set_title('Potential Distribution', fontsize=12)
+    ax1.axvline(x=0, color='red', linestyle='--', label='Left contact')
+    ax1.axvline(x=V_bias, color='orange', linestyle='--', label='Right contact')
+    ax1.legend()
+    
+    # Along x (thickness)
+    x_bins = pd.cut(df['x_m'], bins=20)
+    phi_x = df.groupby(x_bins)['phi_V'].mean()
+    x_centers = [interval.mid for interval in phi_x.index]
+    ax2.plot(np.array(x_centers)*1e6, phi_x.values, 'o-', color='green', linewidth=2)
+    ax2.set_xlabel('Thickness x (µm)', fontsize=11)
+    ax2.set_ylabel('Average φ (V)', fontsize=11)
+    ax2.set_title('Potential vs Thickness', fontsize=12)
+    ax2.grid(True, alpha=0.3)
+    
+    # Along y (length)
+    y_bins = pd.cut(df['y_m'], bins=50)
+    phi_y = df.groupby(y_bins)['phi_V'].mean()
+    y_centers = [interval.mid for interval in phi_y.index]
+    ax3.plot(np.array(y_centers)*1e6, phi_y.values, 'o-', color='purple', linewidth=2)
+    ax3.set_xlabel('Length y (µm)', fontsize=11)
+    ax3.set_ylabel('Average φ (V)', fontsize=11)
+    ax3.set_title('Potential vs Length', fontsize=12)
+    ax3.grid(True, alpha=0.3)
+    
+    # Along z (width)
+    z_bins = pd.cut(df['z_m'], bins=20)
+    phi_z = df.groupby(z_bins)['phi_V'].mean()
+    z_centers = [interval.mid for interval in phi_z.index]
+    ax4.plot(np.array(z_centers)*1e6, phi_z.values, 'o-', color='orange', linewidth=2)
+    ax4.set_xlabel('Width z (µm)', fontsize=11)
+    ax4.set_ylabel('Average φ (V)', fontsize=11)
+    ax4.set_title('Potential vs Width', fontsize=12)
+    ax4.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(fig_dir / 'potential_statistics.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"    ✓ Saved: {fig_dir / 'potential_statistics.png'}")
+    
+    print(f"\n  All plots saved in: {fig_dir}")
+
+
+# ════════════════════════════════════════════════════════════════════════
 #  DIGITAL EXPERIMENT: Electrostatic Screening & Field Crowding
 # ════════════════════════════════════════════════════════════════════════
 
@@ -2121,21 +2297,20 @@ def main():
                 print(f"  *** WARNING: {overshoot_rel*100:.2f}% overshoot — check BCs! ***")
         print()
 
-    # ── XDMF export ──
+    # ── Export solution (CSV + PNG) ──
     out_dir = Path("output")
     out_dir.mkdir(exist_ok=True)
-    phi_phys = fem.Function(V, name="phi_V")
-    phi_phys.x.array[:] = phi_hat.x.array * scaling.V_t
-    try:
-        with dolfinx.io.XDMFFile(comm, str(out_dir / "phi_solution.xdmf"), "w") as xdmf:
-            xdmf.write_mesh(msh)
-            xdmf.write_function(phi_phys)
-        if rank == 0:
-            print(f"Solution written to {out_dir / 'phi_solution.xdmf'}")
-    except Exception as e:
-        if rank == 0:
-            print(f"XDMF export skipped: {e}")
-
+    
+    # Export to CSV
+    export_solution_to_csv(phi_hat, V, scaling, dims, out_dir, comm, rank)
+    
+    # Generate plots
+    if rank == 0:
+        try:
+            plot_solution(out_dir / "solution_data.csv", out_dir, args.V_bias)
+        except Exception as e:
+            print(f"Warning: Could not generate plots: {e}")
+    
     return result
 
 
